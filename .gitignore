@@ -1,0 +1,6 @@
+env/
+__pycache__/
+*.pyc
+*.pyo
+.env
+isw_trading_bot_exemple/env/
