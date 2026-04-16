@@ -171,16 +171,29 @@ html, body {
   border-bottom: 1px solid var(--border);
 }
 
+.market-group + .market-group {
+  border-top: 1px solid var(--border);
+}
+
+.market-group-title {
+  padding: 10px 16px 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.35;
+  background: rgba(200, 168, 75, 0.03);
+  border-bottom: 1px solid var(--border);
+}
+
 .market-card:last-child {
   border-bottom: none;
 }
 
 .market-title {
   display: block;
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 500;
   color: var(--text);
-  margin-bottom: 6px;
   line-height: 1.4;
 }
 
@@ -193,14 +206,6 @@ html, body {
 .market-title-link:hover {
   color: var(--accent);
 }
-
-.market-deadline {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-muted);
-  margin-bottom: 10px;
-}
-
 
 .no-markets {
   padding: 24px 16px;

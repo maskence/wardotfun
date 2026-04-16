@@ -52,7 +52,7 @@ window.Panel = (() => {
       body.innerHTML = '<div class="no-markets">No active markets for this city.</div>';
       return;
     }
-    body.innerHTML = list.map(m => cardHTML(m)).join('');
+    body.innerHTML = groupMarkets(list).map(groupHTML).join('');
   }
 
   function wireTabs(el) {
@@ -65,9 +65,36 @@ window.Panel = (() => {
     });
   }
 
+  function groupMarkets(markets) {
+    const groups = new Map();
+
+    for (const market of markets) {
+      const title = marketTitle(market);
+      const key = marketGroupKey(market);
+      if (!groups.has(key)) {
+        groups.set(key, { label: groupLabel(title), sortKey: groupSortKey(title), markets: [] });
+      }
+      groups.get(key).markets.push(market);
+    }
+
+    return [...groups.values()]
+      .sort((a, b) => a.sortKey.localeCompare(b.sortKey) || a.label.localeCompare(b.label))
+      .map(group => ({
+        ...group,
+        markets: group.markets.sort((a, b) => marketRowSortKey(a) - marketRowSortKey(b) || marketRowLabel(a).localeCompare(marketRowLabel(b))),
+      }));
+  }
+
+  function groupHTML(group) {
+    return `
+      <section class="market-group">
+        <div class="market-group-title">${escHtml(group.label)}</div>
+        ${group.markets.map(cardHTML).join('')}
+      </section>`;
+  }
+
   function cardHTML(market) {
-    const title    = market.title || market.slug || '—';
-    const deadline = market.deadline ? formatDeadline(market.deadline) : null;
+    const title    = marketRowLabel(market);
     const polyUrl  = market.eventSlug && market.slug
       ? `https://polymarket.com/event/${market.eventSlug}/${market.slug}`
       : null;
@@ -77,13 +104,55 @@ window.Panel = (() => {
     return `
       <div class="market-card">
         ${titleEl}
-        ${deadline ? `<div class="market-deadline">Closes ${escHtml(deadline)}</div>` : ''}
       </div>`;
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
+  function marketTitle(market) {
+    return market.title || market.slug || '—';
+  }
+
+  function marketGroupKey(market) {
+    const stem = questionStem(marketTitle(market));
+    return stem.toLowerCase();
+  }
+
+  function groupLabel(title) {
+    return questionStem(title);
+  }
+
+  function groupSortKey(title) {
+    return questionStem(title).toLowerCase();
+  }
+
+  function marketRowLabel(market) {
+    return extractQuestionDate(marketTitle(market)) || formatDeadline(market.deadline);
+  }
+
+  function marketRowSortKey(market) {
+    const extracted = extractQuestionDate(marketTitle(market));
+    if (extracted) {
+      const ts = Date.parse(extracted);
+      if (!Number.isNaN(ts)) return ts;
+    }
+    const raw = market.deadline;
+    if (!raw) return Number.POSITIVE_INFINITY;
+    const ts = Date.parse(raw);
+    return Number.isNaN(ts) ? Number.POSITIVE_INFINITY : ts;
+  }
+
+  function questionStem(title) {
+    return title.replace(/\s+by\s+.+\?$/i, '?').trim();
+  }
+
+  function extractQuestionDate(title) {
+    const match = title.match(/\s+by\s+(.+)\?$/i);
+    return match ? match[1].trim() : null;
+  }
+
   function formatDeadline(raw) {
+    if (!raw) return 'No close date';
     try {
       const d = new Date(raw);
       return isNaN(d) ? raw : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
