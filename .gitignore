@@ -4,3 +4,4 @@ __pycache__/
 *.pyo
 .env
 isw_trading_bot_exemple/env/
+backend/data/layer_cache/

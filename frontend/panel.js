@@ -1,123 +1,84 @@
 window.Panel = (() => {
-  const panel = document.getElementById('city-panel');
   const TABS = ['enter', 'capture', 'capture_all'];
   const TAB_LABELS = { enter: 'Enter', capture: 'Capture', capture_all: 'Capture All' };
 
-  let _oddsCache = {}; // conditionId → {yes, no} | null
+  let _popup   = null;
+  let _markets = null;
   let _activeTab = null;
-  let _currentCity = null;
 
   // ── Public ────────────────────────────────────────────────────────────────
 
-  function open(cityId, cityEntry) {
-    _currentCity = { cityId, cityEntry };
+  function open(cityId, cityEntry, lngLat, point, map) {
+    _markets   = cityEntry.markets || {};
+    _activeTab = TABS.find(t => activeMarkets(t).length > 0) || 'enter';
+
+    if (_popup) { _popup.remove(); _popup = null; }
+
+    const anchor   = point.y < map.getContainer().clientHeight / 3 ? 'top' : 'bottom';
     const cityName = (cityEntry.city || {}).name_en || 'Unknown';
-    const markets = cityEntry.markets || {};
 
-    // Pick first tab that has markets
-    const firstTab = TABS.find(t => (markets[t] || []).length > 0) || 'enter';
-    _activeTab = firstTab;
+    _popup = new maplibregl.Popup({ className: 'city-popup', closeButton: true, maxWidth: '340px', anchor, offset: 12 })
+      .setLngLat(lngLat)
+      .setHTML(buildHTML(cityName))
+      .addTo(map);
 
-    renderPanel(cityName, markets);
-    panel.classList.remove('hidden');
+    const el = _popup.getElement();
+    renderMarkets(el);
+    wireTabs(el);
   }
 
-  function close() {
-    panel.classList.add('hidden');
-    _currentCity = null;
-    _activeTab = null;
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  function activeMarkets(tab) {
+    return (_markets[tab] || []).filter(m => m.active !== false);
   }
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ── Rendering ─────────────────────────────────────────────────────────────
 
-  function renderPanel(cityName, markets) {
-    panel.innerHTML = `
-      <div class="panel-header">
-        <span class="panel-city-name">${escHtml(cityName)}</span>
-        <button class="panel-close" id="panel-close-btn">×</button>
-      </div>
-      ${renderTabs(markets)}
-      <div class="panel-body" id="panel-body"></div>
-    `;
+  function buildHTML(cityName) {
+    const visibleTabs = TABS.filter(t => activeMarkets(t).length > 0);
+    const tabsHTML = visibleTabs.length > 1
+      ? `<div class="popup-tabs">${visibleTabs.map(t =>
+          `<button class="popup-tab${t === _activeTab ? ' active' : ''}" data-tab="${t}">${TAB_LABELS[t]}</button>`
+        ).join('')}</div>`
+      : '';
+    return `<div class="popup-inner"><div class="popup-city-name">${escHtml(cityName)}</div>${tabsHTML}<div class="popup-markets"></div></div>`;
+  }
 
-    document.getElementById('panel-close-btn').addEventListener('click', close);
+  function renderMarkets(el) {
+    const list = activeMarkets(_activeTab);
+    const body = el.querySelector('.popup-markets');
+    if (!list.length) {
+      body.innerHTML = '<div class="no-markets">No active markets for this city.</div>';
+      return;
+    }
+    body.innerHTML = list.map(m => cardHTML(m)).join('');
+  }
 
-    panel.querySelectorAll('.tab-btn').forEach(btn => {
+  function wireTabs(el) {
+    el.querySelectorAll('.popup-tab').forEach(btn => {
       btn.addEventListener('click', () => {
         _activeTab = btn.dataset.tab;
-        panel.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
-        renderMarketList(markets[_activeTab] || []);
+        el.querySelectorAll('.popup-tab').forEach(b => b.classList.toggle('active', b === btn));
+        renderMarkets(el);
       });
     });
-
-    renderMarketList(markets[_activeTab] || []);
   }
 
-  function renderTabs(markets) {
-    const visibleTabs = TABS.filter(t => (markets[t] || []).length > 0);
-    if (visibleTabs.length <= 1) return ''; // no tabs needed for single type
-    const buttons = visibleTabs.map(t => `
-      <button class="tab-btn ${t === _activeTab ? 'active' : ''}" data-tab="${t}">
-        ${TAB_LABELS[t]}
-      </button>
-    `).join('');
-    return `<div class="panel-tabs">${buttons}</div>`;
-  }
-
-  function renderMarketList(marketList) {
-    const body = document.getElementById('panel-body');
-    if (!marketList.length) {
-      body.innerHTML = '<div class="no-markets">No markets for this city.</div>';
-      return;
-    }
-    body.innerHTML = marketList.map((m, i) => renderMarketCard(m, i)).join('');
-
-    // Fetch odds for each market
-    marketList.forEach((m, i) => {
-      const conditionId = m.conditionId;
-      if (!conditionId) return;
-      if (_oddsCache[conditionId] !== undefined) {
-        updateOddsEl(i, _oddsCache[conditionId]);
-      } else {
-        API.fetchOdds(conditionId).then(odds => {
-          _oddsCache[conditionId] = odds;
-          updateOddsEl(i, odds);
-        });
-      }
-    });
-  }
-
-  function renderMarketCard(market, idx) {
-    const title = market.title || market.slug || '—';
+  function cardHTML(market) {
+    const title    = market.title || market.slug || '—';
     const deadline = market.deadline ? formatDeadline(market.deadline) : null;
-    const slug = market.slug || '';
-    const polyUrl = slug ? `https://polymarket.com/event/${slug}` : null;
-
+    const polyUrl  = market.eventSlug && market.slug
+      ? `https://polymarket.com/event/${market.eventSlug}/${market.slug}`
+      : null;
+    const titleEl  = polyUrl
+      ? `<a class="market-title market-title-link" href="${escHtml(polyUrl)}" target="_blank" rel="noopener">${escHtml(title)}</a>`
+      : `<div class="market-title">${escHtml(title)}</div>`;
     return `
       <div class="market-card">
-        <div class="market-title">${escHtml(title)}</div>
+        ${titleEl}
         ${deadline ? `<div class="market-deadline">Closes ${escHtml(deadline)}</div>` : ''}
-        <div class="market-odds" id="odds-${idx}">
-          <span class="odds-loading">loading odds…</span>
-        </div>
-        ${polyUrl ? `<a class="market-link" href="${escHtml(polyUrl)}" target="_blank" rel="noopener">→ Bet on Polymarket</a>` : ''}
-      </div>
-    `;
-  }
-
-  function updateOddsEl(idx, odds) {
-    const el = document.getElementById(`odds-${idx}`);
-    if (!el) return;
-    if (!odds) {
-      el.innerHTML = '<span class="odds-unavailable">odds unavailable</span>';
-      return;
-    }
-    const yesPct = Math.round((odds.yes || 0) * 100);
-    const noPct = Math.round((odds.no || 0) * 100);
-    el.innerHTML = `
-      <span class="odds-pill yes">YES ${yesPct}¢</span>
-      <span class="odds-pill no">NO ${noPct}¢</span>
-    `;
+      </div>`;
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -125,20 +86,13 @@ window.Panel = (() => {
   function formatDeadline(raw) {
     try {
       const d = new Date(raw);
-      if (isNaN(d)) return raw;
-      return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-    } catch {
-      return raw;
-    }
+      return isNaN(d) ? raw : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    } catch { return raw; }
   }
 
   function escHtml(str) {
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
-  return { open, close };
+  return { open };
 })();

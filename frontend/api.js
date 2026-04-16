@@ -8,6 +8,5 @@ window.API = (() => {
   return {
     fetchISWLayers: () => request('/api/isw-layers'),
     fetchCityMarketMap: () => request('/api/city-market-map'),
-    fetchOdds: (conditionId) => request(`/api/markets/${conditionId}/odds`),
   };
 })();

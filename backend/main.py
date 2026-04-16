@@ -3,12 +3,11 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 import city_map
-import gamma_client
 from isw_poller import ISWPoller
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -52,14 +51,6 @@ def isw_layers():
 @app.get("/api/city-market-map")
 def get_city_market_map():
     return city_map.get()
-
-
-@app.get("/api/markets/{condition_id}/odds")
-def get_odds(condition_id: str):
-    odds = gamma_client.get_market_odds(condition_id)
-    if odds is None:
-        raise HTTPException(status_code=503, detail="Odds unavailable")
-    return odds
 
 
 @app.post("/api/admin/reload-city-map")
