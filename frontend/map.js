@@ -1,6 +1,4 @@
 (async () => {
-  // ── Tile styles ───────────────────────────────────────────────────────────
-
   const ESRI = 'https://server.arcgisonline.com/ArcGIS/rest/services';
   const OFM_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty';
 
@@ -13,234 +11,1058 @@
     return _ofmStyle;
   }
 
-  // Scale the stop values in a MapLibre interpolate width expression by factor.
   function scaleWidth(expr, factor) {
     if (typeof expr === 'number') return expr * factor;
     if (!Array.isArray(expr) || expr[0] !== 'interpolate') return expr;
-    const r = [...expr];
-    for (let i = 4; i < r.length; i += 2) r[i] = r[i] * factor;
-    return r;
+    const scaled = [...expr];
+    for (let i = 4; i < scaled.length; i += 2) scaled[i] = scaled[i] * factor;
+    return scaled;
+  }
+
+  function marketCityBasemapFilter(baseFilter) {
+    if (!_marketCityNames.length) return baseFilter;
+    const names = ['literal', _marketCityNames];
+    const excludesMarketCities = ['all',
+      ['!', ['in', ['coalesce', ['get', 'name_en'], ''], names]],
+      ['!', ['in', ['coalesce', ['get', 'name:latin'], ''], names]],
+    ];
+    return baseFilter ? ['all', baseFilter, excludesMarketCities] : excludesMarketCities;
   }
 
   async function buildHybridStyle() {
     const base = await fetchOFMStyle();
     const style = JSON.parse(JSON.stringify(base));
+    const settlementMinZoom = {
+      label_town: 7,
+      label_village: 10.5,
+      label_other: 11.5,
+    };
     style.layers = style.layers
-      .filter(l => l.type === 'line' || l.type === 'symbol')
-      .map(l => {
-        if (l.type === 'symbol') {
-          return { ...l, paint: { ...l.paint, 'text-color': '#ffffff', 'text-halo-color': '#000000', 'text-halo-width': 1.5 } };
+      .filter(layer => layer.type === 'line' || layer.type === 'symbol')
+      .map(layer => {
+        if (layer.type === 'symbol') {
+          const isPlaceLabel = layer['source-layer'] === 'place';
+          const placeFilter = isPlaceLabel ? marketCityBasemapFilter(layer.filter) : layer.filter;
+          return {
+            ...layer,
+            ...(settlementMinZoom[layer.id] !== undefined ? { minzoom: settlementMinZoom[layer.id] } : {}),
+            ...(placeFilter ? { filter: placeFilter } : {}),
+            metadata: {
+              ...layer.metadata,
+              ...(isPlaceLabel ? { 'wardotfun:base-filter': layer.filter || null } : {}),
+            },
+            layout: {
+              ...layer.layout,
+              ...(isPlaceLabel ? {
+                'text-field': ['coalesce', ['get', 'name_en'], ['get', 'name:latin']],
+              } : {}),
+            },
+            paint: {
+              ...layer.paint,
+              'text-color': '#ffffff',
+              'text-halo-color': '#000000',
+              'text-halo-width': 1.5,
+            },
+          };
         }
-        if (l.id === 'boundary_2') {
-          return { ...l, paint: { ...l.paint, 'line-color': '#aaaaaa', 'line-width': scaleWidth(l.paint['line-width'], 1.5), 'line-opacity': 1 } };
+        if (layer.id === 'boundary_2') {
+          return {
+            ...layer,
+            paint: {
+              ...layer.paint,
+              'line-color': '#aaaaaa',
+              'line-width': scaleWidth(layer.paint['line-width'], 1.5),
+              'line-opacity': 1,
+            },
+          };
         }
-        if (l.id === 'boundary_disputed') {
-          return { ...l, paint: { ...l.paint, 'line-color': '#aaaaaa', 'line-width': scaleWidth(l.paint['line-width'], 1.5), 'line-opacity': 0.7 } };
+        if (layer.id === 'boundary_disputed') {
+          return {
+            ...layer,
+            paint: {
+              ...layer.paint,
+              'line-color': '#aaaaaa',
+              'line-width': scaleWidth(layer.paint['line-width'], 1.5),
+              'line-opacity': 0.7,
+            },
+          };
         }
-        if (l['source-layer'] === 'transportation') {
-          return { ...l, paint: { ...l.paint, 'line-width': scaleWidth(l.paint['line-width'], 0.5) } };
+        if (layer['source-layer'] === 'transportation') {
+          return {
+            ...layer,
+            paint: {
+              ...layer.paint,
+              'line-width': scaleWidth(layer.paint['line-width'], 0.5),
+              'line-opacity': ['interpolate', ['linear'], ['zoom'], 7, 0, 10, 0.2, 14, 0.5],
+            },
+          };
         }
-        if (l['source-layer'] === 'waterway' && (l.id === 'waterway_river' || l.id === 'waterway_other')) {
-          return { ...l, paint: { ...l.paint, 'line-width': scaleWidth(l.paint['line-width'], 2.5) } };
+        if (layer['source-layer'] === 'waterway' && (layer.id === 'waterway_river' || layer.id === 'waterway_other')) {
+          return {
+            ...layer,
+            paint: {
+              ...layer.paint,
+              'line-width': scaleWidth(layer.paint['line-width'], 2.5),
+            },
+          };
         }
-        return l;
+        return layer;
       });
-    style.sources['satellite'] = {
+
+    style.sources.satellite = {
       type: 'raster',
       tiles: [`${ESRI}/World_Imagery/MapServer/tile/{z}/{y}/{x}`],
-      tileSize: 256, attribution: 'Tiles © Esri',
+      tileSize: 256,
+      attribution: 'Tiles © Esri',
     };
     style.layers.unshift({ id: 'satellite-base', type: 'raster', source: 'satellite' });
     return style;
   }
 
   function makeRasterStyle(id, tiles, attribution) {
-    return { version: 8, sources: { [id]: { type: 'raster', tiles, tileSize: 256, attribution } }, layers: [{ id, type: 'raster', source: id }] };
+    return {
+      version: 8,
+      glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
+      sources: { [id]: { type: 'raster', tiles, tileSize: 256, attribution } },
+      layers: [{ id, type: 'raster', source: id }],
+    };
   }
 
   const TILESETS = [
-    { id: 'hybrid',    label: 'Hybrid',    getStyle: buildHybridStyle },
-    { id: 'satellite', label: 'Satellite', getStyle: () => makeRasterStyle('sat',  [`${ESRI}/World_Imagery/MapServer/tile/{z}/{y}/{x}`], 'Tiles © Esri') },
-    { id: 'dark',      label: 'Dark',      getStyle: () => makeRasterStyle('dark', ['https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png'], '© CartoDB') },
-    { id: 'street',    label: 'Street',    getStyle: () => makeRasterStyle('osm',  ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], '© OpenStreetMap') },
-    { id: 'topo',      label: 'Topo',      getStyle: () => makeRasterStyle('topo', [`${ESRI}/World_Topo_Map/MapServer/tile/{z}/{y}/{x}`], 'Tiles © Esri') },
+    { id: 'hybrid', label: 'Hybrid', group: 'Reference', getStyle: buildHybridStyle },
+    { id: 'street', label: 'Street', group: 'Reference', getStyle: () => makeRasterStyle('osm', ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], '© OpenStreetMap') },
+    { id: 'dark', label: 'Dark', group: 'Reference', getStyle: () => makeRasterStyle('dark', ['https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png'], '© CartoDB') },
+    { id: 'topo', label: 'Topographic', group: 'Terrain', getStyle: () => makeRasterStyle('topo', [`${ESRI}/World_Topo_Map/MapServer/tile/{z}/{y}/{x}`], 'Tiles © Esri') },
+    { id: 'satellite', label: 'Satellite', group: 'Imagery', getStyle: () => makeRasterStyle('sat', [`${ESRI}/World_Imagery/MapServer/tile/{z}/{y}/{x}`], 'Tiles © Esri') },
   ];
-
-  // ── Layer/city styles ─────────────────────────────────────────────────────
-
-  const ISW_STYLE = {
-    control:      { color: '#8b1a1a', fill: 'rgba(139,26,26,0.3)'    },
-    infiltration: { color: '#b59f3b', fill: 'rgba(212,185,106,0.35)' },
-    gains:        { color: '#cc3333', fill: 'rgba(224,85,85,0.35)'   },
-    advances:     { color: '#cc6622', fill: 'rgba(224,136,68,0.35)'  },
-  };
 
   const CITY_COLORS = { capture_all: '#cc3333', capture: '#cc6622', enter: '#b59f3b' };
 
-  // ── State ─────────────────────────────────────────────────────────────────
+  const MAP_ICONS = {
+    'market-city-icon': '/icons/market-city.svg',
+    'market-target-icon': '/icons/market-target.svg',
+    'geolocation-icon': '/icons/geolocation.svg',
+  };
 
-  let _activeId      = 'hybrid';
-  let _iswData       = null;
-  let _cityMap       = null;
-  let _cityEntries   = {};
+  const CITY_LEGEND_ITEMS = [
+    { label: 'Enter city',       color: '#ffffff', borderColor: '#b59f3b', swatch: 'symbol', icon: MAP_ICONS['market-city-icon'] },
+    { label: 'Capture',          color: '#ffffff', borderColor: '#cc3333', swatch: 'symbol', icon: MAP_ICONS['market-city-icon'] },
+    { label: 'Capture all',      color: '#ffffff', borderColor: '#cc3333', swatch: 'symbol', icon: MAP_ICONS['market-city-icon'] },
+    { label: 'Capture target',   color: '#cc3333', swatch: 'symbol', icon: MAP_ICONS['market-target-icon'] },
+  ];
+
+  const GEO_COLORS = { ru: '#cc3333', ua: '#4488cc', unknown: '#888888' };
+
+  let _activeTilesetId = 'hybrid';
+  let _mappers = [];
+  let _activeMapperId = null;
+  let _overlayData = null;
+  let _fortData = null;
+  let _geoData = null;
+  let _cityMap = null;
+  let _cityEntries = {};
   let _targetEntries = {};
-  let _lastUpdated   = null;
+  let _overlaySourceIds = [];
+  let _overlayLayerIds = [];
+  let _fortSourceIds = [];
+  let _fortLayerIds = [];
+  let _basemapSourceIds = [];
+  let _basemapLayerIds = [];
+  const _fortLayerVisibility = new Map();
+  let _marketCityNames = [];
+  let _geoPopup = null;
+  let _twitterWidgetsPromise = null;
+  let _geoDates = [];
+  let _geoDate = null;
+  let _geoRequestSerial = 0;
+  let _geoEventsBound = false;
+  let _startupInitialized = false;
 
-  // ── Init map (async — fetch style first, no blank placeholder) ────────────
+  // Start application data immediately. None of these requests should wait for
+  // raster/vector tiles or other MapLibre source loading.
+  const startupMappersPromise = API.startup.mappers;
+  const startupGeoPromise = API.startup.geolocations;
+  const startupCityPromise = API.startup.cityMap;
+  const startupMarketPromise = API.startup.marketData;
+  // Start this large response on the next task. Local marker images and mapper
+  // setup get onto the browser's request queue first, while the fortification
+  // download still proceeds in parallel with rendering.
+  const startupFortPromise = new Promise(resolve => {
+    setTimeout(() => API.fetchFortifications().then(resolve), 0);
+  });
+  const startupMapperPromise = startupMappersPromise.then(async index => {
+    const selected = index?.mappers?.find(mapper => mapper.id === 'isw') || index?.mappers?.[0];
+    return { index, selected, overlay: selected ? await API.fetchMapperOverlay(selected.id) : null };
+  });
 
-  let initialStyle;
-  try {
-    initialStyle = await buildHybridStyle();
-  } catch (e) {
-    console.warn('OFM style fetch failed, falling back to satellite', e);
-    initialStyle = makeRasterStyle('sat', [`${ESRI}/World_Imagery/MapServer/tile/{z}/{y}/{x}`], 'Tiles © Esri');
-    _activeId = 'satellite';
-  }
+  const hybridStylePromise = buildHybridStyle();
+  const bootstrapStyle = {
+    version: 8,
+    glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
+    sources: {},
+    layers: [{ id: 'bootstrap-background', type: 'background', paint: { 'background-color': '#101214' } }],
+  };
 
   const map = new maplibregl.Map({
     container: 'map',
-    style: initialStyle,
+    style: bootstrapStyle,
     center: [31.2, 48.5],
     zoom: 6,
   });
 
-  // ── Tile switcher ─────────────────────────────────────────────────────────
-
-  function buildTileSwitcher() {
-    const el = document.getElementById('tile-switcher');
-    el.innerHTML = TILESETS.map(t =>
-      `<button class="tile-btn ${t.id === _activeId ? 'active' : ''}" data-tile="${t.id}">${t.label}</button>`
-    ).join('');
-    el.querySelectorAll('.tile-btn').forEach(btn =>
-      btn.addEventListener('click', () => switchTileset(btn.dataset.tile))
-    );
-  }
-
-  async function switchTileset(id) {
-    if (id === _activeId) return;
-    const tileset = TILESETS.find(t => t.id === id);
-    if (!tileset) return;
-    _activeId = id;
-    document.querySelectorAll('.tile-btn').forEach(b =>
-      b.classList.toggle('active', b.dataset.tile === id)
-    );
-    const style = await tileset.getStyle();
-    // transformStyle merges our custom sources/layers into the new basemap
-    // instead of wiping them — no re-add needed after the switch.
-    map.setStyle(style, {
-      transformStyle: (prevStyle, nextStyle) => {
-        if (!prevStyle) return nextStyle;
-        const customSources = {};
-        for (const [sid, src] of Object.entries(prevStyle.sources || {})) {
-          if (sid.startsWith('isw-') || sid === 'cities' || sid === 'targets') customSources[sid] = src;
-        }
-        const customLayers = (prevStyle.layers || []).filter(l =>
-          l.id.startsWith('isw-') || l.id.startsWith('cities-') || l.id.startsWith('targets-')
-        );
-        return {
-          ...nextStyle,
-          sources: { ...nextStyle.sources, ...customSources },
-          layers: [...nextStyle.layers, ...customLayers],
-        };
-      },
+  function loadMapIcon(id, url) {
+    if (map.hasImage(id)) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => {
+        if (!map.hasImage(id)) map.addImage(id, image);
+        resolve();
+      };
+      image.onerror = () => reject(new Error(`Unable to load map icon: ${url}`));
+      image.src = url;
     });
   }
 
-  buildTileSwitcher();
-
-  // ── Data layers ───────────────────────────────────────────────────────────
-
-  function readdDataLayers() {
-    if (_iswData) addISWLayers(_iswData);
-    if (_cityMap) { addCityLayers(_cityMap); addTargetLayers(_cityMap); }
+  async function ensureMapIcons() {
+    await Promise.all(Object.entries(MAP_ICONS).map(([id, url]) => loadMapIcon(id, url)));
   }
 
-  function addISWLayers(data) {
-    if (!data?.layers) return;
-    for (const name of ['control', 'advances', 'gains', 'infiltration']) {
-      const fc = data.layers[name];
-      if (!fc) continue;
-      const sid = `isw-${name}`;
-      if (map.getSource(sid)) {
-        map.getSource(sid).setData(fc);
-      } else {
-        map.addSource(sid, { type: 'geojson', data: fc });
-        map.addLayer({ id: `${sid}-fill`, type: 'fill', source: sid, paint: { 'fill-color': ISW_STYLE[name].fill } });
-        map.addLayer({ id: `${sid}-line`, type: 'line', source: sid, paint: { 'line-color': ISW_STYLE[name].color, 'line-width': 1.5 } });
+  function buildTileSwitcher() {
+    const el = document.getElementById('tile-switcher');
+    const groups = [...new Set(TILESETS.map(tileset => tileset.group))];
+    el.className = 'basemap-control';
+    el.innerHTML = `
+      <div class="basemap-menu" id="basemap-menu" role="radiogroup" aria-label="Map background" hidden>
+        <div class="basemap-menu-title">Map background</div>
+        ${groups.map(group => `
+          <div class="basemap-section">
+            <div class="basemap-section-title">${group}</div>
+            ${TILESETS.filter(tileset => tileset.group === group).map(tileset => `
+              <button class="basemap-option ${tileset.id === _activeTilesetId ? 'active' : ''}"
+                      type="button" role="radio" aria-checked="${tileset.id === _activeTilesetId}"
+                      data-tile="${tileset.id}">
+                <span class="basemap-radio"></span>
+                <span>${tileset.label}</span>
+              </button>
+            `).join('')}
+          </div>
+        `).join('')}
+      </div>
+      <button class="basemap-toggle" type="button" aria-label="Choose map background"
+              aria-controls="basemap-menu" aria-expanded="false" title="Map background">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m12 3 8 5-8 5-8-5 8-5Z"></path>
+          <path d="m4 12 8 5 8-5M4 16l8 5 8-5"></path>
+        </svg>
+      </button>`;
+
+    const toggle = el.querySelector('.basemap-toggle');
+    const menu = el.querySelector('.basemap-menu');
+    const setOpen = open => {
+      menu.hidden = !open;
+      toggle.setAttribute('aria-expanded', String(open));
+      el.classList.toggle('open', open);
+    };
+
+    toggle.addEventListener('click', event => {
+      event.stopPropagation();
+      setOpen(menu.hidden);
+    });
+    el.querySelectorAll('.basemap-option').forEach(option => {
+      option.addEventListener('click', () => {
+        setOpen(false);
+        switchTileset(option.dataset.tile);
+      });
+    });
+    document.addEventListener('click', event => {
+      if (!el.contains(event.target)) setOpen(false);
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape') setOpen(false);
+    });
+  }
+
+  function buildMapperSwitcher() {
+    const el = document.getElementById('mapper-switcher');
+    el.className = 'switcher-group';
+    el.innerHTML = _mappers.map(mapper =>
+      `<button class="tile-btn ${mapper.id === _activeMapperId ? 'active' : ''}" data-mapper="${escHtml(mapper.id)}">${escHtml(mapper.display_name)}</button>`
+    ).join('');
+    el.querySelectorAll('[data-mapper]').forEach(btn => {
+      btn.addEventListener('click', () => switchMapper(btn.dataset.mapper));
+    });
+  }
+
+  function isApplicationLayer(id) {
+    return id.startsWith('overlay-') || id.startsWith('fort-') ||
+      id.startsWith('cities-') || id.startsWith('targets-') || id.startsWith('geo-');
+  }
+
+  function installBasemap(style) {
+    // Basemap sources can spend a long time fetching tile metadata. Add them to
+    // the existing lightweight style instead of calling setStyle(), which would
+    // tear down the already-rendered application layers until all metadata loads.
+    for (const id of [..._basemapLayerIds].reverse()) {
+      if (map.getLayer(id)) map.removeLayer(id);
+    }
+    for (const id of _basemapSourceIds) {
+      if (map.getSource(id)) map.removeSource(id);
+    }
+    _basemapLayerIds = [];
+    _basemapSourceIds = [];
+
+    for (const [id, source] of Object.entries(style.sources || {})) {
+      if (map.getSource(id)) continue;
+      map.addSource(id, source);
+      _basemapSourceIds.push(id);
+    }
+
+    const before = (map.getStyle().layers || []).find(layer => isApplicationLayer(layer.id))?.id;
+    for (const layer of style.layers || []) {
+      if (map.getLayer(layer.id)) continue;
+      map.addLayer(layer, before);
+      _basemapLayerIds.push(layer.id);
+    }
+    if (map.getLayer('bootstrap-background')) map.removeLayer('bootstrap-background');
+    setMarketCityBasemapLabels(_cityMap || { cities: {} });
+    raiseMarkerLayers();
+  }
+
+  async function switchTileset(id) {
+    if (id === _activeTilesetId) return;
+    const tileset = TILESETS.find(entry => entry.id === id);
+    if (!tileset) return;
+    _activeTilesetId = id;
+    document.querySelectorAll('#tile-switcher .basemap-option').forEach(option => {
+      const active = option.dataset.tile === id;
+      option.classList.toggle('active', active);
+      option.setAttribute('aria-checked', String(active));
+    });
+    const style = await tileset.getStyle();
+    installBasemap(style);
+  }
+
+  async function switchMapper(id) {
+    if (!id) return;
+    if (id === _activeMapperId && _overlayData?.mapper_id === id) return;
+    renderMapperMeta({ display_name: mapperDisplayName(id), status: 'loading' });
+    const data = await API.fetchMapperOverlay(id);
+    if (!data || data.error) {
+      renderMapperMeta({ display_name: mapperDisplayName(id), status: 'error' });
+      return;
+    }
+    _activeMapperId = id;
+    _overlayData = data;
+    buildMapperSwitcher();
+    renderMapperMeta(data);
+    addOverlayLayers(data);
+    renderLegend();
+  }
+
+  function mapperDisplayName(id) {
+    return _mappers.find(mapper => mapper.id === id)?.display_name || id || 'Overlay';
+  }
+
+  function renderMapperMeta(meta) {
+    const el = document.getElementById('mapper-meta');
+    if (!meta) {
+      el.textContent = 'Overlay: unavailable';
+      return;
+    }
+    if (meta.status === 'loading') {
+      el.textContent = `${meta.display_name}: loading…`;
+      return;
+    }
+    const freshness = meta.last_updated ? `${meta.display_name}: updated ${relativeTime(meta.last_updated)}` : `${meta.display_name}: unavailable`;
+    const stateClass = meta.status === 'stale' ? 'mapper-state-stale' : meta.status === 'error' ? 'mapper-state-error' : '';
+    el.innerHTML = `<span class="${stateClass}">${escHtml(freshness)}</span>`;
+  }
+
+  function relativeTime(unixSeconds) {
+    const seconds = Math.max(0, Math.round(Date.now() / 1000 - unixSeconds));
+    if (seconds < 60) return `${seconds}s ago`;
+    if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
+    if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
+    return `${Math.round(seconds / 86400)}d ago`;
+  }
+
+  function readdDataLayers() {
+    if (_overlayData) addOverlayLayers(_overlayData);
+    if (_geoData) addGeoLayers(_geoData);
+    if (_cityMap) {
+      addCityLayers(_cityMap);
+      addTargetLayers(_cityMap);
+    }
+    if (_fortData) addFortLayers(_fortData);
+  }
+
+  function removeOverlayLayers() {
+    for (const layerId of [..._overlayLayerIds].reverse()) {
+      if (map.getLayer(layerId)) map.removeLayer(layerId);
+    }
+    for (const sourceId of _overlaySourceIds) {
+      if (map.getSource(sourceId)) map.removeSource(sourceId);
+    }
+    _overlayLayerIds = [];
+    _overlaySourceIds = [];
+  }
+
+  function addOverlayLayers(payload) {
+    if (!map.getStyle()?.layers?.length) return;
+    removeOverlayLayers();
+    for (const layer of payload.layers || []) {
+      const sourceId = `overlay-${payload.mapper_id}-${layer.id}`;
+      map.addSource(sourceId, { type: 'geojson', data: layer.data });
+      _overlaySourceIds.push(sourceId);
+      addOverlayLayerSet(sourceId, layer);
+    }
+    raiseMarkerLayers();
+  }
+
+  const MARKER_LAYER_IDS = [
+    'geo-marker', 'geo-highlight',
+    'cities-beacon-halo', 'cities-beacon-hover', 'cities-beacon',
+    'targets-circle', 'targets-circle-hover',
+    'cities-beacon-label',
+    'geo-icon', 'cities-beacon-icon', 'targets-icon',
+  ];
+
+  function raiseMarkerLayers() {
+    for (const id of MARKER_LAYER_IDS) {
+      if (map.getLayer(id)) map.moveLayer(id);
+    }
+  }
+
+  function _beforeCities() {
+    const firstMarker = (map.getStyle().layers || []).find(layer => MARKER_LAYER_IDS.includes(layer.id));
+    if (firstMarker) return firstMarker.id;
+    return map.getLayer('cities-fill') ? 'cities-fill' : undefined;
+  }
+
+  function addOverlayLayerSet(sourceId, layer) {
+    const paint = layer.paint || {};
+    const before = _beforeCities();
+    if (layer.geom_type === 'polygon') {
+      const fillId = `${sourceId}-fill`;
+      const lineId = `${sourceId}-line`;
+      map.addLayer({
+        id: fillId,
+        type: 'fill',
+        source: sourceId,
+        paint: {
+          'fill-color': ['coalesce', ['get', 'fill_color'], paint.fill_color || '#999999'],
+          'fill-opacity': ['coalesce', ['get', 'fill_opacity'], paint.fill_opacity ?? 0.25],
+        },
+      }, before);
+      map.addLayer({
+        id: lineId,
+        type: 'line',
+        source: sourceId,
+        paint: {
+          'line-color': ['coalesce', ['get', 'line_color'], paint.line_color || paint.fill_color || '#999999'],
+          'line-opacity': ['coalesce', ['get', 'line_opacity'], paint.line_opacity ?? 1],
+          'line-width': ['coalesce', ['get', 'line_width'], paint.line_width ?? 1.5],
+        },
+      }, before);
+      _overlayLayerIds.push(fillId, lineId);
+      return;
+    }
+
+    if (layer.geom_type === 'line') {
+      const lineId = `${sourceId}-line`;
+      map.addLayer({
+        id: lineId,
+        type: 'line',
+        source: sourceId,
+        paint: {
+          'line-color': ['coalesce', ['get', 'line_color'], paint.line_color || '#999999'],
+          'line-opacity': ['coalesce', ['get', 'line_opacity'], paint.line_opacity ?? 1],
+          'line-width': ['coalesce', ['get', 'line_width'], paint.line_width ?? 1.5],
+        },
+      }, before);
+      _overlayLayerIds.push(lineId);
+      return;
+    }
+
+    const circleId = `${sourceId}-circle`;
+    map.addLayer({
+      id: circleId,
+      type: 'circle',
+      source: sourceId,
+      paint: {
+        'circle-color': ['coalesce', ['get', 'circle_color'], paint.circle_color || '#999999'],
+        'circle-opacity': ['coalesce', ['get', 'circle_opacity'], paint.circle_opacity ?? 1],
+        'circle-radius': ['coalesce', ['get', 'circle_radius'], paint.circle_radius ?? 4],
+        'circle-stroke-color': paint.circle_stroke_color || '#ffffff',
+        'circle-stroke-width': paint.circle_stroke_width ?? 1.5,
+      },
+    }, before);
+    _overlayLayerIds.push(circleId);
+  }
+
+  function addFortLayerSet(sourceId, layer) {
+    const paint = layer.paint || {};
+    const before = _beforeCities();
+    const layout = { visibility: _fortLayerVisibility.get(layer.id) === false ? 'none' : 'visible' };
+    if (layer.geom_type === 'polygon') {
+      const fillId = `${sourceId}-fill`;
+      const lineId = `${sourceId}-line`;
+      map.addLayer({ id: fillId, type: 'fill', source: sourceId, layout, paint: { 'fill-color': paint.fill_color || '#aaaaaa', 'fill-opacity': paint.fill_opacity ?? 0.3 } }, before);
+      map.addLayer({ id: lineId, type: 'line', source: sourceId, layout, paint: { 'line-color': paint.line_color || '#cccccc', 'line-opacity': paint.line_opacity ?? 0.85, 'line-width': paint.line_width ?? 1.5 } }, before);
+      _fortLayerIds.push(fillId, lineId);
+      return;
+    }
+    if (layer.geom_type === 'line') {
+      const lineId = `${sourceId}-line`;
+      map.addLayer({ id: lineId, type: 'line', source: sourceId, layout, paint: { 'line-color': paint.line_color || '#cccccc', 'line-opacity': paint.line_opacity ?? 0.85, 'line-width': paint.line_width ?? 1.5 } }, before);
+      _fortLayerIds.push(lineId);
+      return;
+    }
+    const circleId = `${sourceId}-circle`;
+    map.addLayer({ id: circleId, type: 'circle', source: sourceId, layout, paint: { 'circle-color': paint.circle_color || '#cccccc', 'circle-opacity': paint.circle_opacity ?? 0.85, 'circle-radius': paint.circle_radius ?? 4, 'circle-stroke-color': paint.circle_stroke_color || '#ffffff', 'circle-stroke-width': paint.circle_stroke_width ?? 1.5 } }, before);
+    _fortLayerIds.push(circleId);
+  }
+
+  function addFortLayers(data) {
+    for (const id of [..._fortLayerIds].reverse())
+      if (map.getLayer(id)) map.removeLayer(id);
+    for (const id of _fortSourceIds)
+      if (map.getSource(id)) map.removeSource(id);
+    _fortLayerIds = [];
+    _fortSourceIds = [];
+
+    for (const layer of data.layers || []) {
+      if (!_fortLayerVisibility.has(layer.id)) _fortLayerVisibility.set(layer.id, true);
+      const sourceId = `fort-${layer.id}`;
+      map.addSource(sourceId, { type: 'geojson', data: layer.data });
+      _fortSourceIds.push(sourceId);
+      addFortLayerSet(sourceId, layer);
+    }
+    raiseMarkerLayers();
+  }
+
+  function setFortLayerVisibility(dataLayerId, visible) {
+    _fortLayerVisibility.set(dataLayerId, visible);
+    const prefix = `fort-${dataLayerId}-`;
+    for (const layerId of _fortLayerIds) {
+      if (layerId.startsWith(prefix) && map.getLayer(layerId)) {
+        map.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none');
       }
     }
   }
 
-  // ── City layers ───────────────────────────────────────────────────────────
+  function isActiveMarket(market) {
+    return market.status ? market.status === 'active' : market.active !== false;
+  }
 
   function priority(markets) {
-    if ((markets.capture_all || []).length) return 'capture_all';
-    if ((markets.capture     || []).length) return 'capture';
-    if ((markets.enter       || []).length) return 'enter';
+    if ((markets.capture_all || []).some(isActiveMarket)) return 'capture_all';
+    if ((markets.capture || []).some(isActiveMarket)) return 'capture';
+    if ((markets.enter || []).some(isActiveMarket)) return 'enter';
     return null;
+  }
+
+  function setMarketCityBasemapLabels(cityMap) {
+    const names = new Set();
+    for (const entry of Object.values(cityMap.cities || {})) {
+      const hasActiveMarket = Object.values(entry.markets || {})
+        .flat()
+        .some(isActiveMarket);
+      if (!hasActiveMarket) continue;
+
+      const name = (entry.city || {}).name_en;
+      if (!name) continue;
+      names.add(name);
+      names.add(name.split(' (')[0].trim());
+      const osmAlias = name.match(/OSM labels as ([^)]+)/i);
+      if (osmAlias) names.add(osmAlias[1].trim());
+    }
+    _marketCityNames = [...names];
+
+    for (const layer of map.getStyle().layers || []) {
+      if (layer['source-layer'] !== 'place' || !map.getLayer(layer.id)) continue;
+      const baseFilter = layer.metadata?.['wardotfun:base-filter'];
+      map.setFilter(layer.id, marketCityBasemapFilter(baseFilter));
+    }
+  }
+
+  async function addGeoLayers(data) {
+    for (const id of ['geo-icon', 'geo-highlight', 'geo-marker', 'geo-cluster-count', 'geo-clusters']) if (map.getLayer(id)) map.removeLayer(id);
+    if (map.getSource('geolocations')) map.removeSource('geolocations');
+    map.addSource('geolocations', { type: 'geojson', data: geolocationFeatureCollection(data) });
+    map.addLayer({ id: 'geo-marker', type: 'circle', source: 'geolocations', paint: {
+      'circle-radius': ['interpolate', ['linear'], ['zoom'], 5, 8, 9, 10, 13, 13],
+      'circle-color': ['get', 'faction_color'], 'circle-opacity': 0.96,
+      'circle-stroke-width': 2, 'circle-stroke-color': '#111111',
+    }});
+    map.addLayer({ id: 'geo-highlight', type: 'circle', source: 'geolocations', filter: ['==', ['get', 'uuid'], ''], paint: {
+      'circle-radius': 18, 'circle-color': 'rgba(0,0,0,0)', 'circle-stroke-color': '#ffffff', 'circle-stroke-width': 3,
+    }});
+    if (!_geoEventsBound) {
+      map.on('click', 'geo-marker', _onGeoClick);
+      map.on('mouseenter', 'geo-marker', () => { map.getCanvas().style.cursor = 'pointer'; });
+      map.on('mouseleave', 'geo-marker', () => { map.getCanvas().style.cursor = ''; });
+      _geoEventsBound = true;
+    }
+
+    // MapLibre resolves symbol images when the layer is created. Register every
+    // GeoConfirmed image first so a slow icon response cannot leave an empty layer.
+    await ensureGeoIcons(data);
+    if (!map.getSource('geolocations') || map.getLayer('geo-icon')) return;
+    map.addLayer({ id: 'geo-icon', type: 'symbol', source: 'geolocations', layout: {
+      'icon-image': ['get', 'icon_key'], 'icon-size': ['interpolate', ['linear'], ['zoom'], 5, 0.46, 9, 0.55, 13, 0.72],
+      'icon-allow-overlap': true, 'icon-ignore-placement': true,
+    }});
+    map.on('mouseenter', 'geo-icon', () => { map.getCanvas().style.cursor = 'pointer'; });
+    map.on('mouseleave', 'geo-icon', () => { map.getCanvas().style.cursor = ''; });
+    raiseMarkerLayers();
+  }
+
+  function ensureGeoIcons(data) {
+    const icons = new Map((data?.events || [])
+      .filter(event => event.icon_id && event.icon_url)
+      .map(event => [`geo-${event.icon_id}`, event.icon_url]));
+    return Promise.all([...icons].map(([id, url]) => loadMapIcon(id, url).catch(error => {
+      console.warn(error);
+      return null;
+    })));
+  }
+  function geolocationFeatureCollection(data) {
+    return {
+      type: 'FeatureCollection',
+      features: (data?.events || []).map(event => ({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [event.lon, event.lat] },
+        properties: {
+          uuid: event.uuid,
+          faction_color: event.faction_color || "#666666",
+          icon_key: event.icon_id ? `geo-${event.icon_id}` : "geolocation-icon",
+        },
+      })),
+    };
+  }
+
+  function applyGeolocationData(data) {
+    if (!data || !Array.isArray(data.events)) return;
+    _geoData = data;
+    _geoDates = [...new Set(data.dates || [])].sort();
+    _geoDate = data.date || _geoDates.at(-1) || null;
+    if (map.getSource('geolocations')) {
+      map.getSource('geolocations').setData(geolocationFeatureCollection(data));
+    } else if (map.isStyleLoaded()) {
+      addGeoLayers(data);
+    }
+    ensureGeoIcons(data);
+    if (window.MarketDrawer) window.MarketDrawer.setGeolocations(data);
+    renderGeoTimeline();
+    renderLegend();
+  }
+
+  async function selectGeoDate(date) {
+    if (!date || date === _geoDate || !_geoDates.includes(date)) return;
+    const requestSerial = ++_geoRequestSerial;
+    let failed = false;
+    setGeoTimelineLoading(true);
+    try {
+      const data = await API.fetchGeolocations(date);
+      if (requestSerial !== _geoRequestSerial) return;
+      applyGeolocationData(data);
+    } catch (error) {
+      if (requestSerial !== _geoRequestSerial) return;
+      failed = true;
+      console.warn(`Unable to load geolocations for ${date}`, error);
+    } finally {
+      if (requestSerial === _geoRequestSerial) {
+        setGeoTimelineLoading(false);
+        if (failed) renderGeoTimeline(true);
+      }
+    }
+  }
+
+  function compactDateToInput(date) {
+    return date?.length === 8 ? `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6)}` : '';
+  }
+
+  function renderGeoTimeline(hasError = false) {
+    const timeline = document.getElementById('geo-timeline');
+    if (!timeline || !_geoDate) {
+      if (timeline) timeline.hidden = true;
+      return;
+    }
+    timeline.hidden = false;
+    timeline.classList.toggle('error', hasError);
+    const index = _geoDates.indexOf(_geoDate);
+    const [year, month, day] = [_geoDate.slice(0, 4), _geoDate.slice(4, 6), _geoDate.slice(6, 8)];
+    timeline.querySelector('.geo-timeline-date').textContent = `${day}.${month}.${year}`;
+    timeline.querySelector('.geo-timeline-input').value = compactDateToInput(_geoDate);
+    for (const button of timeline.querySelectorAll('[data-geo-step]')) {
+      const nextIndex = index + Number(button.dataset.geoStep);
+      button.disabled = index < 0 || nextIndex < 0 || nextIndex >= _geoDates.length;
+    }
+  }
+
+  function setGeoTimelineLoading(loading) {
+    const timeline = document.getElementById('geo-timeline');
+    if (!timeline) return;
+    timeline.classList.toggle('loading', loading);
+    for (const button of timeline.querySelectorAll('button')) button.disabled = loading;
+    if (!loading) renderGeoTimeline();
+  }
+
+  function buildGeoTimeline() {
+    const timeline = document.getElementById('geo-timeline');
+    const input = timeline?.querySelector('.geo-timeline-input');
+    if (!timeline || !input) return;
+    for (const button of timeline.querySelectorAll('[data-geo-step]')) {
+      button.addEventListener('click', () => {
+        const index = _geoDates.indexOf(_geoDate) + Number(button.dataset.geoStep);
+        selectGeoDate(_geoDates[index]);
+      });
+    }
+    const openCalendar = () => {
+      input.min = compactDateToInput(_geoDates[0]);
+      input.max = compactDateToInput(_geoDates.at(-1));
+      try {
+        if (typeof input.showPicker === 'function') input.showPicker();
+        else input.click();
+      } catch (_error) {
+        input.click();
+      }
+    };
+    timeline.querySelector('.geo-timeline-date').addEventListener('click', openCalendar);
+    timeline.querySelector('.geo-timeline-calendar').addEventListener('click', openCalendar);
+    input.addEventListener('change', () => {
+      const date = input.value.replaceAll('-', '');
+      if (_geoDates.includes(date)) selectGeoDate(date);
+      else renderGeoTimeline(true);
+    });
+  }
+
+  function _onGeoClick(e) {
+    if (!e.features.length) return;
+    window.MarketDrawer.openGeolocation(e.features[0].properties.uuid);
+  }
+
+  function locateGeoEvent(event) {
+    map.flyTo({ center: [event.lon, event.lat], zoom: Math.max(map.getZoom(), 12), duration: 900, essential: true });
+    if (map.getLayer('geo-highlight')) map.setFilter('geo-highlight', ['==', ['get', 'uuid'], event.uuid]);
+    setTimeout(() => {
+      if (map.getLayer('geo-highlight')) map.setFilter('geo-highlight', ['==', ['get', 'uuid'], '']);
+    }, 1800);
+  }
+
+  function extractSourceUrls(value) {
+    return String(value || '')
+      .match(/https?:\/\/[^\s]+/g)
+      ?.map(url => url.replace(/[),.;]+$/, '')) || [];
+  }
+
+  function twitterStatus(url) {
+    try {
+      const parsed = new URL(url);
+      const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+      if (hostname !== 'x.com' && hostname !== 'twitter.com' && hostname !== 'mobile.twitter.com')
+        return null;
+      const match = parsed.pathname.match(/\/status\/(\d+)/);
+      return match ? { id: match[1], url } : null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function telegramPost(url) {
+    try {
+      const parsed = new URL(url);
+      const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+      if (hostname !== 't.me' && hostname !== 'telegram.me') return null;
+      const parts = parsed.pathname.split('/').filter(Boolean);
+      if (parts[0] === 's') parts.shift();
+      if (parts.length !== 2 || parts[0] === 'c' || !/^\d+$/.test(parts[1])) return null;
+      return { post: `${parts[0]}/${parts[1]}`, url };
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function geoSourceHTML(value) {
+    const urls = [...new Set(extractSourceUrls(value))];
+    if (!urls.length) return '';
+
+    const embeds = urls.map(url => {
+      const tweet = twitterStatus(url);
+      if (tweet) return { type: 'twitter', ...tweet };
+      const telegram = telegramPost(url);
+      return telegram ? { type: 'telegram', ...telegram } : null;
+    }).filter(Boolean);
+    const embeddedUrls = new Set(embeds.map(embed => embed.url));
+    const links = urls.filter(url => !embeddedUrls.has(url));
+    const embedsHtml = embeds.length
+      ? `<div class="geo-popup-embeds">${embeds.map(embed => embed.type === 'twitter' ? `
+          <div class="geo-popup-tweet" data-twitter-status="${embed.id}" data-twitter-url="${escHtml(embed.url)}">
+            <span class="geo-popup-embed-loading">Loading post...</span>
+          </div>` : `
+          <div class="geo-popup-telegram" data-telegram-post="${escHtml(embed.post)}" data-telegram-url="${escHtml(embed.url)}">
+            <span class="geo-popup-embed-loading">Loading post...</span>
+          </div>`).join('')}</div>`
+      : '';
+    const linksHtml = links.map(url =>
+      `<a href="${escHtml(url)}" target="_blank" rel="noopener" class="geo-popup-link">Open source ↗</a>`
+    ).join('');
+    return embedsHtml + linksHtml;
+  }
+
+  function loadTwitterWidgets() {
+    if (window.twttr?.widgets?.createTweet) return Promise.resolve(window.twttr);
+    if (_twitterWidgetsPromise) return _twitterWidgetsPromise;
+
+    _twitterWidgetsPromise = new Promise((resolve, reject) => {
+      const scriptUrl = 'https://platform.twitter.com/widgets.js';
+      let script = document.querySelector(`script[src="${scriptUrl}"]`);
+      const timeout = setTimeout(() => reject(new Error('Twitter widgets timed out')), 12_000);
+      const ready = () => {
+        if (!window.twttr?.widgets?.createTweet) {
+          clearTimeout(timeout);
+          reject(new Error('Twitter widgets unavailable'));
+          return;
+        }
+        window.twttr.ready(() => {
+          clearTimeout(timeout);
+          resolve(window.twttr);
+        });
+      };
+      const failed = () => {
+        clearTimeout(timeout);
+        reject(new Error('Twitter widgets failed to load'));
+      };
+
+      if (script) {
+        script.addEventListener('load', ready, { once: true });
+        script.addEventListener('error', failed, { once: true });
+        return;
+      }
+      script = document.createElement('script');
+      script.src = scriptUrl;
+      script.async = true;
+      script.addEventListener('load', ready, { once: true });
+      script.addEventListener('error', failed, { once: true });
+      document.head.appendChild(script);
+    });
+    return _twitterWidgetsPromise;
+  }
+
+  async function renderTwitterEmbed(container) {
+    const statusId = container.dataset.twitterStatus;
+    const sourceUrl = container.dataset.twitterUrl;
+    try {
+      const twitter = await loadTwitterWidgets();
+      if (!container.isConnected) return;
+      container.replaceChildren();
+      const tweet = await twitter.widgets.createTweet(statusId, container, {
+        theme: 'dark',
+        dnt: true,
+        align: 'center',
+        conversation: 'none',
+      });
+      if (!tweet) throw new Error('Post is unavailable');
+    } catch (_error) {
+      if (!container.isConnected) return;
+      container.classList.add('failed');
+      container.innerHTML = `<a href="${escHtml(sourceUrl)}" target="_blank" rel="noopener" class="geo-popup-link">Open post on X ↗</a>`;
+    }
+  }
+
+  function renderTelegramEmbed(container) {
+    const sourceUrl = container.dataset.telegramUrl;
+    const fallback = () => {
+      observer.disconnect();
+      clearTimeout(timeout);
+      if (!container.isConnected) return;
+      container.classList.add('failed');
+      container.innerHTML = `<a href="${escHtml(sourceUrl)}" target="_blank" rel="noopener" class="geo-popup-link">Open post on Telegram ↗</a>`;
+    };
+    const observer = new MutationObserver(() => {
+      if (!container.querySelector('iframe')) return;
+      observer.disconnect();
+      clearTimeout(timeout);
+    });
+    const timeout = setTimeout(fallback, 12_000);
+    const script = document.createElement('script');
+    script.src = 'https://telegram.org/js/telegram-widget.js?22';
+    script.async = true;
+    script.dataset.telegramPost = container.dataset.telegramPost;
+    script.dataset.width = '100%';
+    script.dataset.dark = '1';
+    script.addEventListener('error', fallback, { once: true });
+    container.replaceChildren();
+    observer.observe(container, { childList: true, subtree: true });
+    container.appendChild(script);
   }
 
   function addCityLayers(cityMap) {
     _cityEntries = {};
-    const features = [];
+    const polygonFeatures = [];
+    const beaconFeatures = [];
     for (const [cityId, entry] of Object.entries(cityMap.cities || {})) {
       const p = priority(entry.markets || {});
       if (!p || !entry.geometry) continue;
       _cityEntries[cityId] = entry;
-      features.push({
+      const activeMarkets = Object.values(entry.markets || {})
+        .flat()
+        .filter(isActiveMarket);
+      const properties = {
+        cityId,
+        name: (entry.city || {}).name_en || 'Unknown',
+        marketType: p,
+        marketCount: activeMarkets.length,
+        priorityRank: p === 'capture_all' ? 0 : p === 'capture' ? 1 : 2,
+        color: CITY_COLORS[p],
+      };
+      polygonFeatures.push({
         type: 'Feature',
         id: cityId,
         geometry: entry.geometry,
-        properties: { cityId, name: (entry.city || {}).name_en || 'Unknown', color: CITY_COLORS[p] },
+        properties,
       });
+      if (entry.marker) {
+        beaconFeatures.push({
+          type: 'Feature',
+          id: cityId,
+          geometry: entry.marker,
+          properties,
+        });
+      }
     }
 
-    const fc = { type: 'FeatureCollection', features };
+    const polygons = { type: 'FeatureCollection', features: polygonFeatures };
+    const beacons = { type: 'FeatureCollection', features: beaconFeatures };
 
     if (map.getSource('cities')) {
-      map.getSource('cities').setData(fc);
+      map.getSource('cities').setData(polygons);
+      if (map.getSource('city-beacons')) map.getSource('city-beacons').setData(beacons);
+      raiseMarkerLayers();
       return;
     }
 
-    map.addSource('cities', { type: 'geojson', data: fc });
-    // Transparent fill — hit detection only (hover/click events fire on fill, not line)
-    map.addLayer({ id: 'cities-fill',       type: 'fill', source: 'cities', paint: { 'fill-color': ['get', 'color'], 'fill-opacity': 0 } });
-    // White casing underneath for contrast against dark ISW fills
-    map.addLayer({ id: 'cities-line-case',  type: 'line', source: 'cities', paint: { 'line-color': '#ffffff', 'line-width': 5, 'line-opacity': 0.5 } });
-    // Colored dashed border — visually distinct from solid ISW territory lines
-    map.addLayer({ id: 'cities-line',       type: 'line', source: 'cities', paint: { 'line-color': ['get', 'color'], 'line-width': 3, 'line-dasharray': [4, 1.5], 'line-opacity': 1 } });
-    // Subtle fill on hover — just enough to show which polygon is active
-    map.addLayer({ id: 'cities-fill-hover', type: 'fill', source: 'cities', paint: { 'fill-color': ['get', 'color'], 'fill-opacity': 0.15 }, filter: ['==', ['get', 'cityId'], ''] });
+    map.addSource('cities', { type: 'geojson', data: polygons });
+    map.addSource('city-beacons', { type: 'geojson', data: beacons });
+    map.addLayer({ id: 'cities-fill', type: 'fill', source: 'cities', paint: { 'fill-color': '#d8d0cf', 'fill-opacity': 0.09 } });
+    map.addLayer({
+      id: 'cities-line',
+      type: 'line',
+      source: 'cities',
+      paint: {
+        'line-color': '#f5f2ec',
+        'line-width': ['interpolate', ['linear'], ['zoom'], 5, 1, 10, 1.5],
+        'line-opacity': 0.9,
+      },
+    });
+    map.addLayer({ id: 'cities-fill-hover', type: 'fill', source: 'cities', paint: { 'fill-color': '#ffffff', 'fill-opacity': 0.16 }, filter: ['==', ['get', 'cityId'], ''] });
+    map.addLayer({
+      id: 'cities-beacon-halo',
+      type: 'circle',
+      source: 'city-beacons',
+      paint: {
+        'circle-radius': ['interpolate', ['linear'], ['zoom'],
+          5, ['match', ['get', 'marketType'], 'capture_all', 9, 'capture', 8, 7],
+          10, ['match', ['get', 'marketType'], 'capture_all', 12, 'capture', 11, 10],
+        ],
+        'circle-color': '#090909',
+        'circle-opacity': 0.9,
+      },
+    });
+    map.addLayer({
+      id: 'cities-beacon-hover',
+      type: 'circle',
+      source: 'city-beacons',
+      paint: {
+        'circle-radius': ['interpolate', ['linear'], ['zoom'], 5, 11, 10, 15],
+        'circle-color': ['get', 'color'],
+        'circle-opacity': 0.28,
+        'circle-stroke-color': '#ffffff',
+        'circle-stroke-width': 1,
+      },
+      filter: ['==', ['get', 'cityId'], ''],
+    });
+    map.addLayer({
+      id: 'cities-beacon',
+      type: 'circle',
+      source: 'city-beacons',
+      paint: {
+        'circle-radius': ['interpolate', ['linear'], ['zoom'],
+          5, ['match', ['get', 'marketType'], 'capture_all', 6.5, 'capture', 6, 5.5],
+          10, ['match', ['get', 'marketType'], 'capture_all', 9, 'capture', 8, 7],
+        ],
+        'circle-color': '#ffffff',
+        'circle-opacity': 1,
+        'circle-stroke-color': ['match', ['get', 'marketType'], 'enter', '#b59f3b', '#cc3333'],
+        'circle-stroke-width': 3,
+      },
+    });
+    map.addLayer({
+      id: 'cities-beacon-icon',
+      type: 'symbol',
+      source: 'city-beacons',
+      layout: {
+        'icon-image': 'market-city-icon',
+        'icon-size': ['interpolate', ['linear'], ['zoom'], 5, 0.4, 10, 0.56],
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true,
+        'symbol-sort-key': ['get', 'priorityRank'],
+      },
+    });
+    map.addLayer({
+      id: 'cities-beacon-label',
+      type: 'symbol',
+      source: 'city-beacons',
+      minzoom: 5,
+      layout: {
+        'text-field': ['get', 'name'],
+        'text-font': ['Noto Sans Regular'],
+        'text-size': ['interpolate', ['linear'], ['zoom'], 5, 10, 11, 14],
+        'text-anchor': 'top',
+        'text-offset': [0, 1.25],
+        'text-optional': true,
+        'symbol-sort-key': ['get', 'priorityRank'],
+      },
+      paint: {
+        'text-color': '#ffffff',
+        'text-halo-color': '#111111',
+        'text-halo-width': 2,
+        'text-halo-blur': 0.5,
+      },
+    });
+    raiseMarkerLayers();
   }
-
-  // ── Target layers (capture market specific points) ────────────────────────
 
   function addTargetLayers(cityMap) {
     _targetEntries = {};
     const features = [];
 
     for (const [cityId, entry] of Object.entries(cityMap.cities || {})) {
-      const captureMarkets = (entry.markets?.capture || []).filter(m => m.target && m.active !== false);
+      const captureMarkets = (entry.markets?.capture || []).filter(market => market.target && isActiveMarket(market));
       if (!captureMarkets.length) continue;
 
-      // Group markets by exact target coords (multiple deadlines can share one target)
-      const byCoord = {};
-      for (const m of captureMarkets) {
-        const key = `${m.target.lon},${m.target.lat}`;
-        if (!byCoord[key]) byCoord[key] = [];
-        byCoord[key].push(m);
+      const byObjective = {};
+      for (const market of captureMarkets) {
+        const coordKey = `${market.target.lon},${market.target.lat}`;
+        const key = market.eventSlug || coordKey;
+        if (!byObjective[key]) byObjective[key] = { coordKey, markets: [] };
+        byObjective[key].markets.push(market);
       }
 
-      for (const [coordKey, markets] of Object.entries(byCoord)) {
+      for (const [objectiveKey, objective] of Object.entries(byObjective)) {
+        const { coordKey, markets } = objective;
         const [lon, lat] = coordKey.split(',').map(Number);
-        const targetKey = `${cityId}::${coordKey}`;
+        const targetKey = `${cityId}::${objectiveKey}`;
+        const targetLabel = markets[0].target?.label || 'Capture target';
         _targetEntries[targetKey] = {
+          cityId,
           cityEntry: { ...entry, markets: { enter: [], capture: markets, capture_all: [] } },
           lngLat: [lon, lat],
         };
         features.push({
           type: 'Feature',
-          properties: { targetKey, cityName: (entry.city || {}).name_en || 'Unknown' },
+          properties: { targetKey, cityName: (entry.city || {}).name_en || 'Unknown', targetLabel },
           geometry: { type: 'Point', coordinates: [lon, lat] },
         });
       }
@@ -250,6 +1072,7 @@
 
     if (map.getSource('targets')) {
       map.getSource('targets').setData(fc);
+      raiseMarkerLayers();
       return;
     }
 
@@ -258,11 +1081,12 @@
       id: 'targets-circle',
       type: 'circle',
       source: 'targets',
+      minzoom: 10,
       paint: {
         'circle-radius': 5,
-        'circle-color': '#cc6622',
+        'circle-color': '#cc3333',
         'circle-stroke-width': 2,
-        'circle-stroke-color': '#ffffff',
+        'circle-stroke-color': '#111111',
         'circle-opacity': 0.95,
       },
     });
@@ -270,32 +1094,52 @@
       id: 'targets-circle-hover',
       type: 'circle',
       source: 'targets',
+      minzoom: 10,
       paint: {
-        'circle-radius': 8,
-        'circle-color': '#cc6622',
+        'circle-radius': 7,
+        'circle-color': '#cc3333',
         'circle-stroke-width': 2,
         'circle-stroke-color': '#ffffff',
         'circle-opacity': 1,
       },
       filter: ['==', ['get', 'targetKey'], ''],
     });
+    map.addLayer({
+      id: 'targets-icon',
+      type: 'symbol',
+      source: 'targets',
+      minzoom: 10,
+      layout: {
+        'icon-image': 'market-target-icon',
+        'icon-size': 0.4,
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true,
+      },
+    });
+    raiseMarkerLayers();
   }
 
-  // City events registered ONCE on the map object — survive setStyle.
   const _cityPopup = new maplibregl.Popup({ closeButton: false, offset: 8 });
+
+  function setCityHover(cityId) {
+    if (map.getLayer('cities-fill-hover'))
+      map.setFilter('cities-fill-hover', ['==', ['get', 'cityId'], cityId || '']);
+    if (map.getLayer('cities-beacon-hover'))
+      map.setFilter('cities-beacon-hover', ['==', ['get', 'cityId'], cityId || '']);
+  }
 
   map.on('mousemove', 'cities-fill', e => {
     if (!e.features.length) return;
     if (map.queryRenderedFeatures(e.point, { layers: ['targets-circle'] }).length) return;
     map.getCanvas().style.cursor = 'pointer';
-    const f = e.features[0];
-    map.setFilter('cities-fill-hover', ['==', ['get', 'cityId'], f.properties.cityId]);
-    _cityPopup.setLngLat(e.lngLat).setText(f.properties.name).addTo(map);
+    const feature = e.features[0];
+    setCityHover(feature.properties.cityId);
+    _cityPopup.setLngLat(e.lngLat).setText(feature.properties.name).addTo(map);
   });
 
   map.on('mouseleave', 'cities-fill', () => {
     map.getCanvas().style.cursor = '';
-    map.setFilter('cities-fill-hover', ['==', ['get', 'cityId'], '']);
+    setCityHover('');
     _cityPopup.remove();
   });
 
@@ -303,17 +1147,39 @@
     if (!e.features.length) return;
     if (map.queryRenderedFeatures(e.point, { layers: ['targets-circle'] }).length) return;
     const { cityId } = e.features[0].properties;
-    const entry = _cityEntries[cityId];
-    if (entry) window.Panel.open(cityId, entry, e.lngLat, e.point, map);
+    window.MarketDrawer.openCity(cityId);
+  });
+
+  map.on('mousemove', 'cities-beacon', e => {
+    if (!e.features.length) return;
+    if (map.getLayer('targets-circle') && map.queryRenderedFeatures(e.point, { layers: ['targets-circle'] }).length) return;
+    const feature = e.features[0];
+    map.getCanvas().style.cursor = 'pointer';
+    setCityHover(feature.properties.cityId);
+    _cityPopup.setLngLat(feature.geometry.coordinates).setText(feature.properties.name).addTo(map);
+  });
+
+  map.on('mouseleave', 'cities-beacon', () => {
+    map.getCanvas().style.cursor = '';
+    setCityHover('');
+    _cityPopup.remove();
+  });
+
+  map.on('click', 'cities-beacon', e => {
+    if (!e.features.length) return;
+    if (map.getLayer('targets-circle') && map.queryRenderedFeatures(e.point, { layers: ['targets-circle'] }).length) return;
+    const feature = e.features[0];
+    const { cityId } = feature.properties;
+    window.MarketDrawer.openCity(cityId);
   });
 
   map.on('mousemove', 'targets-circle', e => {
     if (!e.features.length) return;
     map.getCanvas().style.cursor = 'pointer';
-    const f = e.features[0];
-    map.setFilter('targets-circle-hover', ['==', ['get', 'targetKey'], f.properties.targetKey]);
-    map.setFilter('cities-fill-hover', ['==', ['get', 'cityId'], '']);
-    _cityPopup.setLngLat(e.lngLat).setText(`${f.properties.cityName} — capture target`).addTo(map);
+    const feature = e.features[0];
+    map.setFilter('targets-circle-hover', ['==', ['get', 'targetKey'], feature.properties.targetKey]);
+    setCityHover('');
+    _cityPopup.setLngLat(e.lngLat).setText(`${feature.properties.cityName} — ${feature.properties.targetLabel}`).addTo(map);
   });
 
   map.on('mouseleave', 'targets-circle', () => {
@@ -325,34 +1191,257 @@
   map.on('click', 'targets-circle', e => {
     if (!e.features.length) return;
     const { targetKey } = e.features[0].properties;
-    const t = _targetEntries[targetKey];
-    if (t) window.Panel.open(targetKey, t.cityEntry, t.lngLat, e.point, map);
+    const entry = _targetEntries[targetKey];
+    if (entry) window.MarketDrawer.openCity(entry.cityId);
   });
 
-  // ── Freshness ─────────────────────────────────────────────────────────────
-
-  function renderFreshness() {
-    const el = document.getElementById('isw-freshness');
-    if (!_lastUpdated) { el.textContent = 'ISW: unavailable'; return; }
-    const s = Math.round(Date.now() / 1000 - _lastUpdated);
-    el.textContent = `ISW: updated ${s < 60 ? `${s}s` : `${Math.round(s / 60)}m`} ago`;
+  function locateMarketCity(cityId, entry) {
+    const coordinates = entry.marker?.coordinates;
+    if (!coordinates) return;
+    map.flyTo({
+      center: coordinates,
+      zoom: Math.max(map.getZoom(), 10),
+      duration: 900,
+      essential: true,
+    });
+    setCityHover(cityId);
+    setTimeout(() => setCityHover(''), 1800);
   }
 
-  // ── Initial data load — fires once when the map first loads ───────────────
+  buildTileSwitcher();
+  buildGeoTimeline();
 
-  map.once('load', async () => {
-    const [layerData, cityMap] = await Promise.all([
-      API.fetchISWLayers(),
-      API.fetchCityMarketMap(),
-    ]);
-    if (layerData) { _iswData = layerData; addISWLayers(layerData); _lastUpdated = layerData.last_updated; renderFreshness(); }
-    if (cityMap)   { _cityMap = cityMap;   addCityLayers(cityMap); addTargetLayers(cityMap); }
+  function retryGeolocations() {
+    const timer = setInterval(async () => {
+      const data = await API.fetchGeolocations();
+      if (!Array.isArray(data?.events)) return;
+      clearInterval(timer);
+      applyGeolocationData(data);
+    }, 10_000);
+  }
+
+  function retryFortifications() {
+    const timer = setInterval(async () => {
+      const data = await API.fetchFortifications();
+      if (!data?.layers?.length) return;
+      clearInterval(timer);
+      _fortData = data;
+      if (map.isStyleLoaded()) addFortLayers(data);
+      renderLegend();
+    }, 10_000);
+  }
+
+  function initializeCoreLayers() {
+    const cityTask = startupCityPromise.then(cityMap => {
+      if (!cityMap) return;
+      _cityMap = cityMap;
+      setMarketCityBasemapLabels(cityMap);
+      addCityLayers(cityMap);
+      addTargetLayers(cityMap);
+      window.MarketDrawer.init(cityMap, {
+        onLocate: locateMarketCity,
+        onResize: () => map.resize(),
+        onGeoLocate: locateGeoEvent,
+      });
+      startupMarketPromise.then(data => window.MarketDrawer.setMarketData(data));
+      renderLegend();
+    });
+
+    const geoTask = startupGeoPromise.then(data => {
+      if (Array.isArray(data?.events)) applyGeolocationData(data);
+      else retryGeolocations();
+    });
+
+    const mapperTask = startupMapperPromise.then(({ index, selected, overlay }) => {
+      if (!index?.mappers?.length || !selected) {
+        renderMapperMeta(null);
+        return;
+      }
+      _mappers = index.mappers;
+      _activeMapperId = selected.id;
+      buildMapperSwitcher();
+      if (!overlay || overlay.error) {
+        renderMapperMeta({ display_name: selected.display_name, status: 'error' });
+        return;
+      }
+      _overlayData = overlay;
+      renderMapperMeta(overlay);
+      addOverlayLayers(overlay);
+      renderLegend();
+    });
+
+    // Fetching began in parallel above, but heavy fortification layers are only
+    // attached after the core mapper, geolocation, and city work has settled.
+    Promise.allSettled([mapperTask, geoTask, cityTask]).then(() => {
+      // Give the browser a paint with markers and mapper layers before mounting
+      // the heavier fortification geometry. Its request has already run in parallel.
+      requestAnimationFrame(() => requestAnimationFrame(() => startupFortPromise.then(fortData => {
+        if (!fortData?.layers?.length) {
+          retryFortifications();
+          return;
+        }
+        _fortData = fortData;
+        addFortLayers(fortData);
+        renderLegend();
+      })));
+    });
+  }
+
+  function initializeAtStyleData() {
+    if (_startupInitialized || !map.getStyle()?.layers?.length) return;
+    _startupInitialized = true;
+    ensureMapIcons()
+      .catch(error => console.warn('Unable to preload local map icons', error))
+      .finally(initializeCoreLayers);
+  }
+
+  // styledata fires as soon as the style graph exists, before raster/vector tile
+  // completion. Core application layers must not wait for MapLibre's load event.
+  map.on('styledata', initializeAtStyleData);
+  initializeAtStyleData();
+
+  hybridStylePromise.then(style => {
+    if (_activeTilesetId === 'hybrid') installBasemap(style);
+  }).catch(error => {
+    console.warn('OFM style fetch failed, falling back to satellite', error);
+    if (_activeTilesetId !== 'hybrid') return;
+    _activeTilesetId = 'satellite';
+    installBasemap(makeRasterStyle('sat', [`${ESRI}/World_Imagery/MapServer/tile/{z}/{y}/{x}`], 'Tiles © Esri'));
+  });
+
+  map.on('style.load', async () => {
+    await ensureMapIcons();
+    if (!_startupInitialized) initializeAtStyleData();
+    else readdDataLayers();
   });
 
   setInterval(async () => {
-    const data = await API.fetchISWLayers();
-    if (data && map.isStyleLoaded()) { _iswData = data; addISWLayers(data); _lastUpdated = data.last_updated; renderFreshness(); }
+    const data = await API.fetchMarketData();
+    if (data) window.MarketDrawer.setMarketData(data);
+  }, 60_000);
+
+  setInterval(async () => {
+    if (!_activeMapperId || !map.isStyleLoaded()) return;
+    const data = await API.fetchMapperOverlay(_activeMapperId);
+    if (!data || data.error) return;
+    _overlayData = data;
+    renderMapperMeta(data);
+    addOverlayLayers(data);
+    renderLegend();
   }, 30_000);
 
-  setInterval(renderFreshness, 10_000);
+  setInterval(async () => {
+    if (!map.isStyleLoaded()) return;
+    const wasLatest = _geoDate && _geoDate === _geoDates.at(-1);
+    const data = await API.fetchGeolocations(wasLatest ? null : _geoDate);
+    if (!Array.isArray(data?.events)) return;
+    applyGeolocationData(data);
+  }, 30 * 60_000); // 30 min — geolocations are daily data
+
+  setInterval(async () => {
+    const mapperIndex = await API.fetchMappers();
+    if (!mapperIndex?.mappers?.length) return;
+    _mappers = mapperIndex.mappers;
+    buildMapperSwitcher();
+    if (!_overlayData && _activeMapperId) {
+      renderMapperMeta(_mappers.find(mapper => mapper.id === _activeMapperId));
+    }
+  }, 60_000);
+
+  function hexToRgba(hex, alpha) {
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    return `rgba(${r},${g},${b},${alpha})`;
+  }
+
+  function legendSwatchHTML(item) {
+    if (item.swatch === 'symbol')
+      return legendSymbolHTML(item.color, item.icon, item.borderColor);
+    if (item.swatch === 'dashed')
+      return `<span class="legend-swatch-dashed" style="border-color:${item.color}"></span>`;
+    if (item.swatch === 'circle')
+      return `<span class="legend-swatch-circle" style="background:${item.color}"></span>`;
+    if (item.swatch === 'line')
+      return `<span class="legend-swatch-line" style="background:${item.color}"></span>`;
+    // polygon
+    const fill = hexToRgba(item.color, item.fillOpacity ?? 0.35);
+    return `<span class="legend-swatch-polygon" style="background:${fill};border:2px solid ${item.color}"></span>`;
+  }
+
+  function legendSymbolHTML(color, icon, borderColor = '#111111') {
+    return `<span class="legend-swatch-symbol" style="background:${color};border-color:${borderColor}"><img src="${icon}" alt=""></span>`;
+  }
+
+  function mapperLayerSwatch(layer) {
+    const p = layer.paint || {};
+    if (layer.geom_type === 'polygon') {
+      const color = p.line_color || p.fill_color || '#999';
+      const fill = p.fill_color ? hexToRgba(p.fill_color, p.fill_opacity ?? 0.35) : 'transparent';
+      return `<span class="legend-swatch-polygon" style="background:${fill};border:2px solid ${color}"></span>`;
+    }
+    if (layer.geom_type === 'line')
+      return `<span class="legend-swatch-line" style="background:${p.line_color || '#999'}"></span>`;
+    return `<span class="legend-swatch-circle" style="background:${p.circle_color || '#999'}"></span>`;
+  }
+
+  function renderLegend() {
+    const el = document.getElementById('legend');
+    if (!el) return;
+
+    let html = `<div class="legend-header">Legend</div>`;
+
+    html += `<div class="legend-section"><div class="legend-title">Cities</div>`;
+    for (const item of CITY_LEGEND_ITEMS)
+      html += `<div class="legend-item">${legendSwatchHTML(item)}${escHtml(item.label)}</div>`;
+    html += `</div>`;
+
+    if (_geoData?.events?.length) {
+      const sources = (_geoData.sources || []).map(source => source.display_name).join(', ') || 'Geolocations';
+      const factions = [...new Map(_geoData.events.map(event => [event.faction_id, event])).values()];
+      html += `<div class="legend-section"><div class="legend-title">${escHtml(sources)}</div>`;
+      for (const faction of factions) {
+        html += `<div class="legend-item">${legendSymbolHTML(faction.faction_color || '#666666', faction.icon_url || MAP_ICONS['geolocation-icon'])}${escHtml(faction.faction_name || 'Unknown')}</div>`;
+      }
+      html += `</div>`;
+    }
+
+    if (_fortData?.layers?.length) {
+      html += `<div class="legend-section"><div class="legend-title">Fortifications</div>`;
+      for (const layer of _fortData.layers) {
+        const checked = _fortLayerVisibility.get(layer.id) !== false;
+        html += `<label class="legend-item legend-toggle ${checked ? '' : 'disabled'}">
+          <input type="checkbox" data-fort-layer="${escHtml(layer.id)}" ${checked ? 'checked' : ''}>
+          ${mapperLayerSwatch(layer)}<span>${escHtml(layer.label)}</span>
+        </label>`;
+      }
+      html += `</div>`;
+    }
+
+    if (_overlayData?.layers?.length) {
+      const visibleLayers = _overlayData.layers.filter(l => l.geom_type !== 'point');
+      if (visibleLayers.length) {
+        html += `<div class="legend-section"><div class="legend-title">${escHtml(_overlayData.display_name || 'Overlay')}</div>`;
+        for (const layer of visibleLayers)
+          html += `<div class="legend-item">${mapperLayerSwatch(layer)}${escHtml(layer.label)}</div>`;
+        html += `</div>`;
+      }
+    }
+
+    el.innerHTML = html;
+    el.querySelectorAll('[data-fort-layer]').forEach(input => {
+      input.addEventListener('change', () => {
+        setFortLayerVisibility(input.dataset.fortLayer, input.checked);
+        input.closest('.legend-toggle').classList.toggle('disabled', !input.checked);
+      });
+    });
+  }
+
+  function escHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
 })();

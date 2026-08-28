@@ -2,7 +2,7 @@ import json
 import logging
 from pathlib import Path
 
-from geo_utils import city_geometry_to_geojson
+from geo_utils import city_geometry_to_geojson, city_geometry_to_marker
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,8 @@ def _load_from_disk() -> dict:
         raw_geometry = entry.get("geometry")
         if raw_geometry:
             entry["geometry"] = city_geometry_to_geojson(raw_geometry)
+            entry["marker"] = city_geometry_to_marker(raw_geometry)
         converted[city_id] = entry
 
     logger.info("city_map: loaded %d cities", len(converted))
-    return {"cities": converted}
+    return {**raw, "cities": converted}

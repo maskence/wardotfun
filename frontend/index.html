@@ -9,17 +9,40 @@
 </head>
 <body>
   <div id="header">
-    <span class="site-name">war.fun</span>
-    <div id="tile-switcher"></div>
-    <span id="isw-freshness">ISW: loading…</span>
+    <div class="header-left">
+      <span class="site-name">war.fun</span>
+      <div id="mapper-switcher"></div>
+    </div>
+    <div class="header-right">
+      <div id="mapper-meta">Overlay: loading…</div>
+    </div>
   </div>
   <div id="app">
     <div id="map"></div>
+    <div id="legend"></div>
+    <div id="tile-switcher"></div>
+    <div id="geo-timeline" hidden aria-label="Geolocation date">
+      <button class="geo-timeline-nav" type="button" data-geo-step="-1" aria-label="Previous geolocation date">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"></path></svg>
+      </button>
+      <button class="geo-timeline-date" type="button" aria-label="Choose geolocation date">--.--.----</button>
+      <button class="geo-timeline-nav" type="button" data-geo-step="1" aria-label="Next geolocation date">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"></path></svg>
+      </button>
+      <button class="geo-timeline-calendar" type="button" aria-label="Open geolocation calendar">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M5 4h14a2 2 0 0 1 2 2v14H3V6a2 2 0 0 1 2-2Z"></path>
+          <path d="M7 2v4M17 2v4M3 9h18M7 13h2M11 13h2M15 13h2M7 17h2M11 17h2M15 17h2"></path>
+        </svg>
+      </button>
+      <input class="geo-timeline-input" type="date" aria-label="Geolocation date">
+    </div>
+    <aside id="market-drawer" aria-label="Cities with prediction markets"></aside>
   </div>
 
-  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
   <script src="/api.js"></script>
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="/drawer.js"></script>
   <script src="/map.js"></script>
-  <script src="/panel.js"></script>
 </body>
 </html>

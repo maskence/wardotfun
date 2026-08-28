@@ -5,3 +5,8 @@ __pycache__/
 .env
 isw_trading_bot_exemple/env/
 backend/data/layer_cache/
+backend/data/*.lock
+.gstack/
+
+backend/data/geoconfirmed.sqlite3*
+backend/data/geoconfirmed_icons/
