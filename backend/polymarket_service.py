@@ -8,7 +8,10 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-import city_map
+try:
+    from . import city_map
+except ImportError:
+    import city_map
 
 logger = logging.getLogger(__name__)
 

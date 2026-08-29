@@ -177,22 +177,32 @@
   let _geoRequestSerial = 0;
   let _geoEventsBound = false;
   let _startupInitialized = false;
+  let _mapState = null;
+  let _temporalMode = false;
+  const _fortStyleLayersByDataId = new Map();
 
   // Start application data immediately. None of these requests should wait for
   // raster/vector tiles or other MapLibre source loading.
+  const startupMapStatePromise = API.startup.mapState;
   const startupMappersPromise = API.startup.mappers;
   const startupGeoPromise = API.startup.geolocations;
   const startupCityPromise = API.startup.cityMap;
   const startupMarketPromise = API.startup.marketData;
-  // Start this large response on the next task. Local marker images and mapper
-  // setup get onto the browser's request queue first, while the fortification
-  // download still proceeds in parallel with rendering.
-  const startupFortPromise = new Promise(resolve => {
-    setTimeout(() => API.fetchFortifications().then(resolve), 0);
+  // A temporal deployment returns only tile metadata. Legacy deployments keep
+  // the old delayed GeoJSON fallback during the compatibility window.
+  const startupFortPromise = startupMapStatePromise.then(state => {
+    if (state?.vector_tiles_enabled) return state.fortifications;
+    return new Promise(resolve => {
+      setTimeout(() => API.fetchFortifications().then(resolve), 0);
+    });
   });
-  const startupMapperPromise = startupMappersPromise.then(async index => {
+  const startupMapperPromise = Promise.all([startupMapStatePromise, startupMappersPromise]).then(async ([state, legacyIndex]) => {
+    const index = state?.vector_tiles_enabled ? { mappers: state.mappers || [] } : legacyIndex;
     const selected = index?.mappers?.find(mapper => mapper.id === 'isw') || index?.mappers?.[0];
-    return { index, selected, overlay: selected ? await API.fetchMapperOverlay(selected.id) : null };
+    const overlay = state?.vector_tiles_enabled
+      ? selected
+      : selected ? await API.fetchMapperOverlay(selected.id) : null;
+    return { state, index, selected, overlay };
   });
 
   const hybridStylePromise = buildHybridStyle();
@@ -345,6 +355,17 @@
   async function switchMapper(id) {
     if (!id) return;
     if (id === _activeMapperId && _overlayData?.mapper_id === id) return;
+    if (_temporalMode) {
+      const data = _mapState?.mappers?.find(mapper => mapper.id === id);
+      if (!data) return;
+      _activeMapperId = id;
+      _overlayData = data;
+      buildMapperSwitcher();
+      renderMapperMeta(data);
+      addOverlayLayers(data);
+      renderLegend();
+      return;
+    }
     renderMapperMeta({ display_name: mapperDisplayName(id), status: 'loading' });
     const data = await API.fetchMapperOverlay(id);
     if (!data || data.error) {
@@ -371,6 +392,10 @@
     }
     if (meta.status === 'loading') {
       el.textContent = `${meta.display_name}: loading…`;
+      return;
+    }
+    if (meta.status === 'unavailable' || meta.available === false) {
+      el.innerHTML = `<span class="mapper-state-error">${escHtml(meta.display_name)}: unavailable for selected date</span>`;
       return;
     }
     const freshness = meta.last_updated ? `${meta.display_name}: updated ${relativeTime(meta.last_updated)}` : `${meta.display_name}: unavailable`;
@@ -410,11 +435,27 @@
   function addOverlayLayers(payload) {
     if (!map.getStyle()?.layers?.length) return;
     removeOverlayLayers();
+    if (!payload?.available && payload?.tile_url !== undefined) return;
+    if (payload.tile_url) {
+      const sourceId = `overlay-${payload.mapper_id}-${payload.snapshot_id}`;
+      map.addSource(sourceId, {
+        type: 'vector',
+        tiles: [payload.tile_url],
+        minzoom: 0,
+        maxzoom: 14,
+      });
+      _overlaySourceIds.push(sourceId);
+      for (const layer of payload.layers || []) {
+        addOverlayLayerSet(sourceId, layer, `overlay-${payload.mapper_id}-${layer.id}`);
+      }
+      raiseMarkerLayers();
+      return;
+    }
     for (const layer of payload.layers || []) {
       const sourceId = `overlay-${payload.mapper_id}-${layer.id}`;
       map.addSource(sourceId, { type: 'geojson', data: layer.data });
       _overlaySourceIds.push(sourceId);
-      addOverlayLayerSet(sourceId, layer);
+      addOverlayLayerSet(sourceId, layer, sourceId);
     }
     raiseMarkerLayers();
   }
@@ -439,16 +480,25 @@
     return map.getLayer('cities-fill') ? 'cities-fill' : undefined;
   }
 
-  function addOverlayLayerSet(sourceId, layer) {
+  function vectorLayerMetadata(layer) {
+    return layer.source_layer ? {
+      'source-layer': layer.source_layer,
+      filter: ['==', ['get', 'layer_key'], layer.id],
+    } : {};
+  }
+
+  function addOverlayLayerSet(sourceId, layer, stylePrefix) {
     const paint = layer.paint || {};
     const before = _beforeCities();
+    const vector = vectorLayerMetadata(layer);
     if (layer.geom_type === 'polygon') {
-      const fillId = `${sourceId}-fill`;
-      const lineId = `${sourceId}-line`;
+      const fillId = `${stylePrefix}-fill`;
+      const lineId = `${stylePrefix}-line`;
       map.addLayer({
         id: fillId,
         type: 'fill',
         source: sourceId,
+        ...vector,
         paint: {
           'fill-color': ['coalesce', ['get', 'fill_color'], paint.fill_color || '#999999'],
           'fill-opacity': ['coalesce', ['get', 'fill_opacity'], paint.fill_opacity ?? 0.25],
@@ -458,6 +508,7 @@
         id: lineId,
         type: 'line',
         source: sourceId,
+        ...vector,
         paint: {
           'line-color': ['coalesce', ['get', 'line_color'], paint.line_color || paint.fill_color || '#999999'],
           'line-opacity': ['coalesce', ['get', 'line_opacity'], paint.line_opacity ?? 1],
@@ -469,11 +520,12 @@
     }
 
     if (layer.geom_type === 'line') {
-      const lineId = `${sourceId}-line`;
+      const lineId = `${stylePrefix}-line`;
       map.addLayer({
         id: lineId,
         type: 'line',
         source: sourceId,
+        ...vector,
         paint: {
           'line-color': ['coalesce', ['get', 'line_color'], paint.line_color || '#999999'],
           'line-opacity': ['coalesce', ['get', 'line_opacity'], paint.line_opacity ?? 1],
@@ -484,11 +536,12 @@
       return;
     }
 
-    const circleId = `${sourceId}-circle`;
+    const circleId = `${stylePrefix}-circle`;
     map.addLayer({
       id: circleId,
       type: 'circle',
       source: sourceId,
+      ...vector,
       paint: {
         'circle-color': ['coalesce', ['get', 'circle_color'], paint.circle_color || '#999999'],
         'circle-opacity': ['coalesce', ['get', 'circle_opacity'], paint.circle_opacity ?? 1],
@@ -500,27 +553,31 @@
     _overlayLayerIds.push(circleId);
   }
 
-  function addFortLayerSet(sourceId, layer) {
+  function addFortLayerSet(sourceId, layer, stylePrefix) {
     const paint = layer.paint || {};
     const before = _beforeCities();
     const layout = { visibility: _fortLayerVisibility.get(layer.id) === false ? 'none' : 'visible' };
+    const vector = vectorLayerMetadata(layer);
     if (layer.geom_type === 'polygon') {
-      const fillId = `${sourceId}-fill`;
-      const lineId = `${sourceId}-line`;
-      map.addLayer({ id: fillId, type: 'fill', source: sourceId, layout, paint: { 'fill-color': paint.fill_color || '#aaaaaa', 'fill-opacity': paint.fill_opacity ?? 0.3 } }, before);
-      map.addLayer({ id: lineId, type: 'line', source: sourceId, layout, paint: { 'line-color': paint.line_color || '#cccccc', 'line-opacity': paint.line_opacity ?? 0.85, 'line-width': paint.line_width ?? 1.5 } }, before);
+      const fillId = `${stylePrefix}-fill`;
+      const lineId = `${stylePrefix}-line`;
+      map.addLayer({ id: fillId, type: 'fill', source: sourceId, ...vector, layout, paint: { 'fill-color': paint.fill_color || '#aaaaaa', 'fill-opacity': paint.fill_opacity ?? 0.3 } }, before);
+      map.addLayer({ id: lineId, type: 'line', source: sourceId, ...vector, layout, paint: { 'line-color': paint.line_color || '#cccccc', 'line-opacity': paint.line_opacity ?? 0.85, 'line-width': paint.line_width ?? 1.5 } }, before);
       _fortLayerIds.push(fillId, lineId);
+      _fortStyleLayersByDataId.set(layer.id, [fillId, lineId]);
       return;
     }
     if (layer.geom_type === 'line') {
-      const lineId = `${sourceId}-line`;
-      map.addLayer({ id: lineId, type: 'line', source: sourceId, layout, paint: { 'line-color': paint.line_color || '#cccccc', 'line-opacity': paint.line_opacity ?? 0.85, 'line-width': paint.line_width ?? 1.5 } }, before);
+      const lineId = `${stylePrefix}-line`;
+      map.addLayer({ id: lineId, type: 'line', source: sourceId, ...vector, layout, paint: { 'line-color': paint.line_color || '#cccccc', 'line-opacity': paint.line_opacity ?? 0.85, 'line-width': paint.line_width ?? 1.5 } }, before);
       _fortLayerIds.push(lineId);
+      _fortStyleLayersByDataId.set(layer.id, [lineId]);
       return;
     }
-    const circleId = `${sourceId}-circle`;
-    map.addLayer({ id: circleId, type: 'circle', source: sourceId, layout, paint: { 'circle-color': paint.circle_color || '#cccccc', 'circle-opacity': paint.circle_opacity ?? 0.85, 'circle-radius': paint.circle_radius ?? 4, 'circle-stroke-color': paint.circle_stroke_color || '#ffffff', 'circle-stroke-width': paint.circle_stroke_width ?? 1.5 } }, before);
+    const circleId = `${stylePrefix}-circle`;
+    map.addLayer({ id: circleId, type: 'circle', source: sourceId, ...vector, layout, paint: { 'circle-color': paint.circle_color || '#cccccc', 'circle-opacity': paint.circle_opacity ?? 0.85, 'circle-radius': paint.circle_radius ?? 4, 'circle-stroke-color': paint.circle_stroke_color || '#ffffff', 'circle-stroke-width': paint.circle_stroke_width ?? 1.5 } }, before);
     _fortLayerIds.push(circleId);
+    _fortStyleLayersByDataId.set(layer.id, [circleId]);
   }
 
   function addFortLayers(data) {
@@ -530,22 +587,41 @@
       if (map.getSource(id)) map.removeSource(id);
     _fortLayerIds = [];
     _fortSourceIds = [];
+    _fortStyleLayersByDataId.clear();
+
+    if (!data) return;
+    if (!data?.available && data?.tile_url !== undefined) return;
+    if (data.tile_url) {
+      const sourceId = `fort-${data.snapshot_id}`;
+      map.addSource(sourceId, {
+        type: 'vector',
+        tiles: [data.tile_url],
+        minzoom: 0,
+        maxzoom: 14,
+      });
+      _fortSourceIds.push(sourceId);
+      for (const layer of data.layers || []) {
+        if (!_fortLayerVisibility.has(layer.id)) _fortLayerVisibility.set(layer.id, true);
+        addFortLayerSet(sourceId, layer, `fort-${layer.id}`);
+      }
+      raiseMarkerLayers();
+      return;
+    }
 
     for (const layer of data.layers || []) {
       if (!_fortLayerVisibility.has(layer.id)) _fortLayerVisibility.set(layer.id, true);
       const sourceId = `fort-${layer.id}`;
       map.addSource(sourceId, { type: 'geojson', data: layer.data });
       _fortSourceIds.push(sourceId);
-      addFortLayerSet(sourceId, layer);
+      addFortLayerSet(sourceId, layer, sourceId);
     }
     raiseMarkerLayers();
   }
 
   function setFortLayerVisibility(dataLayerId, visible) {
     _fortLayerVisibility.set(dataLayerId, visible);
-    const prefix = `fort-${dataLayerId}-`;
-    for (const layerId of _fortLayerIds) {
-      if (layerId.startsWith(prefix) && map.getLayer(layerId)) {
+    for (const layerId of _fortStyleLayersByDataId.get(dataLayerId) || []) {
+      if (map.getLayer(layerId)) {
         map.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none');
       }
     }
@@ -645,7 +721,7 @@
   function applyGeolocationData(data) {
     if (!data || !Array.isArray(data.events)) return;
     _geoData = data;
-    _geoDates = [...new Set(data.dates || [])].sort();
+    if (!_temporalMode) _geoDates = [...new Set(data.dates || [])].sort();
     _geoDate = data.date || _geoDates.at(-1) || null;
     if (map.getSource('geolocations')) {
       map.getSource('geolocations').setData(geolocationFeatureCollection(data));
@@ -658,14 +734,51 @@
     renderLegend();
   }
 
+  function applyTemporalMapState(state, { forceGeometry = false } = {}) {
+    if (!state?.vector_tiles_enabled) return false;
+    const previousOverlayKey = `${_overlayData?.mapper_id || ''}:${_overlayData?.snapshot_id || ''}`;
+    const previousFortKey = `${_fortData?.id || ''}:${_fortData?.snapshot_id || ''}`;
+    _temporalMode = true;
+    _mapState = state;
+    _geoDates = [...new Set(state.available_dates || [])].sort();
+    _geoDate = state.date;
+    _mappers = state.mappers || [];
+    if (!_mappers.some(mapper => mapper.id === _activeMapperId)) {
+      _activeMapperId = (_mappers.find(mapper => mapper.id === 'isw') || _mappers[0])?.id || null;
+    }
+    const nextOverlay = _mappers.find(mapper => mapper.id === _activeMapperId) || null;
+    const nextOverlayKey = `${nextOverlay?.mapper_id || ''}:${nextOverlay?.snapshot_id || ''}`;
+    const nextFort = state.fortifications || null;
+    const nextFortKey = `${nextFort?.id || ''}:${nextFort?.snapshot_id || ''}`;
+    _overlayData = nextOverlay;
+    _fortData = nextFort;
+    buildMapperSwitcher();
+    renderMapperMeta(nextOverlay);
+    if (map.isStyleLoaded()) {
+      if (forceGeometry || previousOverlayKey !== nextOverlayKey) {
+        if (nextOverlay) addOverlayLayers(nextOverlay);
+        else removeOverlayLayers();
+      }
+      if (forceGeometry || previousFortKey !== nextFortKey) addFortLayers(nextFort);
+    }
+    renderGeoTimeline();
+    renderLegend();
+    return true;
+  }
+
   async function selectGeoDate(date) {
     if (!date || date === _geoDate || !_geoDates.includes(date)) return;
     const requestSerial = ++_geoRequestSerial;
     let failed = false;
     setGeoTimelineLoading(true);
     try {
-      const data = await API.fetchGeolocations(date);
+      const [state, data] = await Promise.all([
+        _temporalMode ? API.fetchMapState(date) : Promise.resolve(null),
+        API.fetchGeolocations(date),
+      ]);
       if (requestSerial !== _geoRequestSerial) return;
+      if (_temporalMode && !applyTemporalMapState(state)) throw new Error('Temporal map state unavailable');
+      if (!Array.isArray(data?.events)) throw new Error('GeoConfirmed data unavailable');
       applyGeolocationData(data);
     } catch (error) {
       if (requestSerial !== _geoRequestSerial) return;
@@ -1252,10 +1365,16 @@
       else retryGeolocations();
     });
 
-    const mapperTask = startupMapperPromise.then(({ index, selected, overlay }) => {
+    const mapperTask = startupMapperPromise.then(({ state, index, selected, overlay }) => {
       if (!index?.mappers?.length || !selected) {
         renderMapperMeta(null);
         return;
+      }
+      if (state?.vector_tiles_enabled) {
+        _temporalMode = true;
+        _mapState = state;
+        _geoDates = [...new Set(state.available_dates || [])].sort();
+        _geoDate = state.date;
       }
       _mappers = index.mappers;
       _activeMapperId = selected.id;
@@ -1277,6 +1396,12 @@
       // the heavier fortification geometry. Its request has already run in parallel.
       requestAnimationFrame(() => requestAnimationFrame(() => startupFortPromise.then(fortData => {
         if (!fortData?.layers?.length) {
+          if (_temporalMode) {
+            _fortData = fortData;
+            addFortLayers(fortData);
+            renderLegend();
+            return;
+          }
           retryFortifications();
           return;
         }
@@ -1322,6 +1447,22 @@
 
   setInterval(async () => {
     if (!_activeMapperId || !map.isStyleLoaded()) return;
+    if (_temporalMode) {
+      const selectedBefore = _geoDate;
+      const wasLatest = selectedBefore && selectedBefore === _geoDates.at(-1);
+      const state = await API.fetchMapState(wasLatest ? null : selectedBefore);
+      if (_geoDate !== selectedBefore || !state?.vector_tiles_enabled) return;
+      const dateChanged = state.date !== selectedBefore;
+      if (dateChanged) {
+        const data = await API.fetchGeolocations(state.date);
+        if (_geoDate !== selectedBefore || !Array.isArray(data?.events)) return;
+        applyTemporalMapState(state);
+        applyGeolocationData(data);
+      } else {
+        applyTemporalMapState(state);
+      }
+      return;
+    }
     const data = await API.fetchMapperOverlay(_activeMapperId);
     if (!data || data.error) return;
     _overlayData = data;
@@ -1339,6 +1480,7 @@
   }, 30 * 60_000); // 30 min — geolocations are daily data
 
   setInterval(async () => {
+    if (_temporalMode) return;
     const mapperIndex = await API.fetchMappers();
     if (!mapperIndex?.mappers?.length) return;
     _mappers = mapperIndex.mappers;

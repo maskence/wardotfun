@@ -5,11 +5,15 @@ import threading
 import time
 import urllib.error
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.request import Request, urlopen
 import json
 
-from geo_utils import arcgis_features_to_geojson
+try:
+    from .geo_utils import arcgis_features_to_geojson
+except ImportError:
+    from geo_utils import arcgis_features_to_geojson
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +21,18 @@ CACHE_DIR = Path(__file__).parent / "data" / "mapper_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 KML_NS = {"k": "http://www.opengis.net/kml/2.2"}
+_RAW_CAPTURE = threading.local()
+
+
+@contextmanager
+def capture_raw_responses(callback):
+    """Send successful upstream response bodies to ``callback`` during a fetch."""
+    previous = getattr(_RAW_CAPTURE, "callback", None)
+    _RAW_CAPTURE.callback = callback
+    try:
+        yield
+    finally:
+        _RAW_CAPTURE.callback = previous
 
 
 def _request_bytes(url: str, if_modified_since: str | None = None) -> tuple[bytes | None, str | None]:
@@ -27,7 +43,11 @@ def _request_bytes(url: str, if_modified_since: str | None = None) -> tuple[byte
     try:
         with urlopen(req, timeout=30) as resp:
             last_modified = resp.headers.get("Last-Modified")
-            return resp.read(), last_modified
+            body = resp.read()
+            callback = getattr(_RAW_CAPTURE, "callback", None)
+            if callback:
+                callback(url, body, dict(resp.headers.items()))
+            return body, last_modified
     except urllib.error.HTTPError as exc:
         if exc.code == 304:
             return None, None
@@ -130,6 +150,9 @@ class BaseMapperSource:
     def refresh_if_due(self):
         raise NotImplementedError
 
+    def is_due(self) -> bool:
+        raise NotImplementedError
+
     def get_summary(self) -> dict:
         return {
             "id": self.id,
@@ -152,7 +175,7 @@ class ISWMapperSource(BaseMapperSource):
     display_name = "ISW"
     source_url = "https://storymaps.arcgis.com/stories/36a7f6a6f5a9448496de641cf64bd375"
     attribution = "Institute for the Study of War"
-    refresh_interval = 30
+    refresh_interval = 5 * 60
 
     LAYERS = {
         "control": (
@@ -174,7 +197,7 @@ class ISWMapperSource(BaseMapperSource):
     }
 
     LAYER_TTL = {
-        "control": 24 * 60 * 60,
+        "control": 60 * 60,
     }
 
     LAYER_META = {
@@ -261,6 +284,7 @@ class ISWMapperSource(BaseMapperSource):
                 if fc is None:
                     with self._lock:
                         self._last_fetched[name] = fetched_at
+                        self._last_error = None
                     logger.info("ISW layer %s not modified (304)", name)
                     changed = True
                     continue
@@ -281,6 +305,9 @@ class ISWMapperSource(BaseMapperSource):
                 self._last_error = last_error
         if changed:
             self._save_cache()
+
+    def is_due(self) -> bool:
+        return any(self._should_fetch(name) for name in self.LAYERS)
 
     def get_overlay(self) -> dict:
         with self._lock:
@@ -388,6 +415,7 @@ class GoogleMyMapsMapperSource(BaseMapperSource):
             if xml_bytes is None:
                 with self._lock:
                     self._last_fetched = fetched_at
+                    self._last_error = None
                 logger.info("%s mapper not modified (304)", self.id)
                 self._save_cache()
                 return
@@ -405,6 +433,9 @@ class GoogleMyMapsMapperSource(BaseMapperSource):
             with self._lock:
                 self._last_error = str(exc)
             logger.warning("Failed to refresh %s mapper: %s", self.id, exc)
+
+    def is_due(self) -> bool:
+        return not self._last_fetched or (time.time() - self._last_fetched) >= self.refresh_interval
 
     def get_overlay(self) -> dict:
         with self._lock:
@@ -532,6 +563,7 @@ class GoogleMyMapsMapperSource(BaseMapperSource):
     def _placemark_features(self, placemark: ET.Element, styles: dict[str, dict]) -> list[dict]:
         style = styles.get(placemark.findtext("./k:styleUrl", default="", namespaces=KML_NS), {})
         base_props = {
+            "placemark_id": placemark.attrib.get("id"),
             "name": placemark.findtext("./k:name", default="", namespaces=KML_NS),
             "description": placemark.findtext("./k:description", default="", namespaces=KML_NS),
             "fill_color": style.get("fill_color"),
@@ -615,7 +647,7 @@ class MapperService:
                 "circle_opacity": 0.85,
             },
         )
-        self._fortification.refresh_interval = 7 * 24 * 60 * 60
+        self._fortification.refresh_interval = 24 * 60 * 60
 
         self._sources: dict[str, BaseMapperSource] = {
             "isw": ISWMapperSource(),
@@ -685,17 +717,39 @@ class MapperService:
             ),
         }
         self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
 
     def get_fortification_overlay(self) -> dict:
         return self._fortification.get_overlay()
 
     def start(self):
-        self._fortification.load_cache()
-        for source in self._sources.values():
-            source.load_cache()
+        self.load_caches()
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         logger.info("MapperService: background thread started (initial refresh will happen in background)")
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def load_caches(self):
+        self._fortification.load_cache()
+        for source in self._sources.values():
+            source.load_cache()
+
+    def iter_sources(self):
+        yield "fortifications", self._fortification
+        for source in self._sources.values():
+            yield "mapper", source
+
+    def refresh_once(self):
+        self._fortification.refresh_if_due()
+        for source in self._sources.values():
+            source.refresh_if_due()
 
     def list_mappers(self) -> list[dict]:
         return [self._sources[key].get_summary() for key in self._sources]
@@ -705,10 +759,8 @@ class MapperService:
         return source.get_overlay() if source else None
 
     def _loop(self):
-        while True:
+        while not self._stop.is_set():
             started = time.monotonic()
-            self._fortification.refresh_if_due()
-            for source in self._sources.values():
-                source.refresh_if_due()
+            self.refresh_once()
             elapsed = time.monotonic() - started
-            time.sleep(max(0, 30 - elapsed))
+            self._stop.wait(max(0, 30 - elapsed))

@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import csv, hashlib, io, json, logging, mimetypes, os, re, sqlite3, threading, time
 import urllib.error, urllib.parse
-from datetime import date, datetime, time as day_time, timedelta
+from datetime import date, datetime, time as day_time, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).parent / "data"
@@ -19,6 +20,11 @@ URL_RE = re.compile(r"https?://[^\s,;<>\"']+", re.I)
 # Rough mainland/Crimea extent, expanded by 5% of its width and height on every
 # side so near-border activity remains visible.
 UKRAINE_NEAR_BOUNDS = (43.575, 52.925, 21.075, 41.425)  # south, north, west, east
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+
+def kyiv_today():
+    return datetime.now(KYIV_TZ).date()
 
 
 def is_near_ukraine(lat, lon):
@@ -111,8 +117,8 @@ class GeoConfirmedGeolocationsSource:
     id, display_name = "geoconfirmed", "GeoConfirmed"
     refresh_interval, reconciliation_interval = 1800, 7 * 86400
 
-    def __init__(self, db_path=DB_PATH, icon_dir=ICON_DIR, client=None, today=date.today):
-        self.db_path, self.icon_dir, self.client, self.today = Path(db_path), Path(icon_dir), client or GeoConfirmedClient(), today
+    def __init__(self, db_path=DB_PATH, icon_dir=ICON_DIR, client=None, today=None):
+        self.db_path, self.icon_dir, self.client, self.today = Path(db_path), Path(icon_dir), client or GeoConfirmedClient(), today or kyiv_today
         self._sync_lock, self._last_error = threading.Lock(), None
         self._setup()
 
@@ -291,10 +297,469 @@ class GeoConfirmedGeolocationsSource:
         return {"date":selected,"dates":dates,"daily_counts":{d:counts.get(d,0) for d in dates},"events":events,"filters":{"factions":[{"id":x[0],"name":x[1],"color":x[2]} for x in factions],"icons":[{"id":x[0],"name":x[1]} for x in icons],"origins":origins},"sources":[{"id":self.id,"display_name":self.display_name,"event_count":len(events),"retained_event_count":total,"last_updated":last,"status":"stale" if self._last_error and total else "error" if self._last_error else "ok" if total else "empty"}]}
 
 
+class PostGISGeoConfirmedGeolocationsSource(GeoConfirmedGeolocationsSource):
+    """GeoConfirmed storage compatible with the legacy service response shape."""
+
+    def __init__(self, database=None, icon_dir=ICON_DIR, client=None, today=None, *, read_only=False):
+        try:
+            from .database import PostGISDatabase
+        except ImportError:
+            from database import PostGISDatabase
+
+        self.database = database or PostGISDatabase()
+        self.icon_dir, self.client, self.today = Path(icon_dir), client or GeoConfirmedClient(), today or kyiv_today
+        self.read_only = read_only
+        self._sync_lock, self._last_error = threading.Lock(), None
+        self.icon_dir.mkdir(parents=True, exist_ok=True)
+        if not read_only:
+            with self.database.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO geolocation_metadata(key, value) VALUES ('retention_start', %s)
+                    ON CONFLICT(key) DO NOTHING
+                    """,
+                    ((self.today() - timedelta(days=90)).isoformat(),),
+                )
+
+    @staticmethod
+    def _meta_pg(conn, key):
+        row = conn.execute(
+            "SELECT value FROM geolocation_metadata WHERE key = %s", (key,)
+        ).fetchone()
+        if not row:
+            return None
+        return row["value"] if hasattr(row, "keys") else row[0]
+
+    @staticmethod
+    def _set_meta_pg(conn, key, value):
+        conn.execute(
+            """
+            INSERT INTO geolocation_metadata(key, value) VALUES (%s, %s)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, str(value)),
+        )
+
+    @property
+    def retention_start(self):
+        with self.database.connect() as conn:
+            value = self._meta_pg(conn, "retention_start")
+        return date.fromisoformat(value) if value else self.today() - timedelta(days=90)
+
+    def load_cache(self):
+        with self.database.connect() as conn:
+            count = conn.execute("SELECT count(*) FROM geolocation_events").fetchone()[0]
+            self._last_error = self._meta_pg(conn, "last_error") or None
+        log.info("Loaded PostGIS GeoConfirmed cache: %d events", count)
+
+    def refresh_if_due(self):
+        if self.read_only:
+            return
+        with self.database.connect() as conn:
+            count = conn.execute("SELECT count(*) FROM geolocation_events").fetchone()[0]
+            last = float(self._meta_pg(conn, "last_sync") or 0)
+            weekly = float(self._meta_pg(conn, "last_reconcile") or 0)
+        now = time.time()
+        if not count:
+            self.initial_import()
+        elif now - weekly >= self.reconciliation_interval:
+            self.reconcile()
+        elif now - last >= self.refresh_interval:
+            self.incremental_sync()
+
+    def _try_ingest_lock(self):
+        conn = self.database.connect(autocommit=True)
+        acquired = conn.execute(
+            "SELECT pg_try_advisory_lock(hashtextextended('wardotfun:ingest:geoconfirmed', 0))"
+        ).fetchone()[0]
+        if not acquired:
+            conn.close()
+            return None
+        return conn
+
+    @staticmethod
+    def _release_ingest_lock(conn):
+        if not conn:
+            return
+        try:
+            conn.execute(
+                "SELECT pg_advisory_unlock(hashtextextended('wardotfun:ingest:geoconfirmed', 0))"
+            )
+        finally:
+            conn.close()
+
+    def _record_sync_error(self, error):
+        try:
+            with self.database.connect() as conn:
+                self._set_meta_pg(conn, "last_error", str(error)[:4000])
+                self._set_meta_pg(conn, "last_error_at", time.time())
+        except Exception:
+            log.exception("Could not persist GeoConfirmed sync failure")
+
+    @staticmethod
+    def _json(value):
+        return value if isinstance(value, (list, dict)) else json.loads(value or "[]")
+
+    @classmethod
+    def _event_pg(cls, row, detail=False):
+        event = {
+            "uuid": row["uuid"], "lat": row["lat"], "lon": row["lon"],
+            "description": row["description"], "event_date": row["event_date"].isoformat(),
+            "timestamp": row["timestamp_text"], "time_precision": row["time_precision"],
+            "faction_id": row["faction_id"], "faction_name": row["faction_name"],
+            "faction_color": row["faction_color"], "icon_id": row["icon_id"],
+            "icon_name": row["icon_name"],
+            "icon_url": f"/api/geolocations/icons/{row['icon_id']}" if row["icon_id"] else None,
+            "origin": row["origin"], "equipment": row["equipment"], "units": row["units"],
+        }
+        if detail:
+            event.update({
+                "evidence_links": cls._json(row["evidence_links"]),
+                "geolocation_links": cls._json(row["geolocation_links"]),
+                "plus_code": row["plus_code"],
+                "gear_items": cls._json(row["gear_items"]),
+                "orbat_units": cls._json(row["orbat_units"]),
+                "attribution": {"name": "GeoConfirmed", "url": "https://geoconfirmed.org/ukraine"},
+            })
+        return event
+
+    @staticmethod
+    def _store_icons_pg(conn, icons):
+        records = [item for item in icons.values() if item.get("icon_id")]
+        with conn.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO geolocation_icons(id, name, upstream_path)
+                VALUES (%(icon_id)s, %(icon_name)s, %(icon_path)s)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name, upstream_path = excluded.upstream_path
+                """,
+                records,
+            )
+
+    @staticmethod
+    def _aware_timestamp(value):
+        parsed = parse_timestamp(value)
+        if parsed and parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    @classmethod
+    def _upsert_pg(cls, conn, records):
+        items = []
+        for record in records:
+            item = dict(record)
+            item["occurred_at"] = cls._aware_timestamp(item["timestamp"])
+            for key in ("evidence_links", "geolocation_links", "gear_items", "orbat_units"):
+                item[key] = json.dumps(item[key], ensure_ascii=False)
+            items.append(item)
+        with conn.cursor() as cursor:
+            cursor.executemany(
+                """
+            INSERT INTO geolocation_events(
+                uuid, event_date, timestamp_text, occurred_at, time_precision, location,
+                description, faction_id, faction_name, faction_color, icon_id, icon_name,
+                icon_path, origin, equipment, units, plus_code, evidence_links,
+                geolocation_links, gear_items, orbat_units, source_hash, updated_at
+            ) VALUES (
+                %(uuid)s, %(event_date)s, %(timestamp)s, %(occurred_at)s, %(time_precision)s,
+                ST_SetSRID(ST_MakePoint(%(lon)s, %(lat)s), 4326), %(description)s,
+                %(faction_id)s, %(faction_name)s, %(faction_color)s, %(icon_id)s,
+                %(icon_name)s, %(icon_path)s, %(origin)s, %(equipment)s, %(units)s,
+                %(plus_code)s, %(evidence_links)s::jsonb, %(geolocation_links)s::jsonb,
+                %(gear_items)s::jsonb, %(orbat_units)s::jsonb, %(source_hash)s,
+                to_timestamp(%(updated_at)s)
+            ) ON CONFLICT(uuid) DO UPDATE SET
+                event_date = excluded.event_date,
+                timestamp_text = excluded.timestamp_text,
+                occurred_at = excluded.occurred_at,
+                time_precision = excluded.time_precision,
+                location = excluded.location,
+                description = excluded.description,
+                faction_id = excluded.faction_id,
+                faction_name = excluded.faction_name,
+                faction_color = excluded.faction_color,
+                icon_id = excluded.icon_id,
+                icon_name = excluded.icon_name,
+                icon_path = excluded.icon_path,
+                origin = excluded.origin,
+                equipment = excluded.equipment,
+                units = excluded.units,
+                plus_code = excluded.plus_code,
+                evidence_links = excluded.evidence_links,
+                geolocation_links = excluded.geolocation_links,
+                gear_items = excluded.gear_items,
+                orbat_units = excluded.orbat_units,
+                source_hash = excluded.source_hash,
+                updated_at = excluded.updated_at
+                """,
+                items,
+            )
+
+    def _full_sync(self, reconcile):
+        if self.read_only or not self._sync_lock.acquire(False):
+            return False
+        lock_conn = None
+        try:
+            lock_conn = self._try_ingest_lock()
+            if not lock_conn:
+                return False
+            rows = self.client.get_csv(self.retention_start, self.today() + timedelta(days=1))
+            index, basic_icons = compact_index(self.client.get_json("/api/Placemark/Ukraine"))
+            _, named_icons = compact_index(self.client.get_json("/api/Placemark/Ukraine/icons"))
+            icons = {**basic_icons, **named_icons}
+            records = self._merge_csv(rows, index, icons)
+            with self.database.connect() as conn:
+                # One transaction publishes icons, events, reconciliation removals,
+                # and freshness metadata atomically.
+                self._store_icons_pg(conn, icons)
+                self._upsert_pg(conn, records)
+                if reconcile:
+                    retained = [item["uuid"] for item in records]
+                    if retained:
+                        conn.execute(
+                            "DELETE FROM geolocation_events WHERE event_date >= %s AND NOT (uuid = ANY(%s))",
+                            (self.retention_start, retained),
+                        )
+                    else:
+                        conn.execute(
+                            "DELETE FROM geolocation_events WHERE event_date >= %s",
+                            (self.retention_start,),
+                        )
+                now = time.time()
+                self._set_meta_pg(conn, "last_sync", now)
+                self._set_meta_pg(conn, "last_reconcile", now)
+                self._set_meta_pg(conn, "last_error", "")
+            self._cache_icons()
+            self._last_error = None
+            return True
+        except Exception as exc:
+            self._last_error = str(exc)
+            self._record_sync_error(exc)
+            log.warning("PostGIS GeoConfirmed full sync failed; serving stale data: %s", exc)
+            return False
+        finally:
+            self._release_ingest_lock(lock_conn)
+            self._sync_lock.release()
+
+    def incremental_sync(self):
+        if self.read_only or not self._sync_lock.acquire(False):
+            return False
+        lock_conn = None
+        try:
+            lock_conn = self._try_ingest_lock()
+            if not lock_conn:
+                return False
+            start = max(self.retention_start, self.today() - timedelta(days=7))
+            records = self._merge_csv(
+                self.client.get_csv(start, self.today() + timedelta(days=1)), {}, {}
+            )
+            with self.database.connect(dict_rows=True) as conn:
+                hashes = {
+                    row["uuid"]: row["source_hash"]
+                    for row in conn.execute(
+                        "SELECT uuid, source_hash FROM geolocation_events WHERE event_date >= %s",
+                        (start,),
+                    )
+                }
+                icon_rows = {
+                    row["upstream_path"]: row
+                    for row in conn.execute(
+                        "SELECT * FROM geolocation_icons WHERE upstream_path IS NOT NULL"
+                    )
+                }
+                factions = {
+                    row["faction_name"]: row
+                    for row in conn.execute(
+                        """
+                        SELECT DISTINCT ON (faction_name) faction_name, faction_id, faction_color
+                        FROM geolocation_events ORDER BY faction_name, updated_at DESC
+                        """
+                    )
+                }
+            changed = []
+            for record in records:
+                if hashes.get(record["uuid"]) != record["source_hash"]:
+                    changed.append(self._merge_detail(
+                        record,
+                        self.client.get_json(f"/api/Placemark/detail/{record['uuid']}"),
+                        icon_rows,
+                        factions,
+                    ))
+            with self.database.connect() as conn:
+                self._upsert_pg(conn, changed)
+                self._set_meta_pg(conn, "last_sync", time.time())
+                self._set_meta_pg(conn, "last_error", "")
+            self._cache_icons()
+            self._last_error = None
+            return True
+        except Exception as exc:
+            self._last_error = str(exc)
+            self._record_sync_error(exc)
+            log.warning("PostGIS GeoConfirmed incremental sync failed; serving stale data: %s", exc)
+            return False
+        finally:
+            self._release_ingest_lock(lock_conn)
+            self._sync_lock.release()
+
+    def _cache_icons(self):
+        with self.database.connect(dict_rows=True) as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT e.icon_id, e.icon_path, i.local_name
+                FROM geolocation_events e
+                LEFT JOIN geolocation_icons i ON i.id = e.icon_id
+                WHERE e.icon_id IS NOT NULL AND e.icon_path IS NOT NULL
+                """
+            ).fetchall()
+        for row in rows:
+            if row["local_name"] and (self.icon_dir / row["local_name"]).is_file():
+                continue
+            try:
+                body, mime = self.client.get_bytes(row["icon_path"])
+                ext = mimetypes.guess_extension(mime or "") or Path(row["icon_path"]).suffix or ".png"
+                name = f"{row['icon_id']}{ext}"
+                tmp = self.icon_dir / f".{name}.tmp"
+                tmp.write_bytes(body)
+                tmp.replace(self.icon_dir / name)
+                with self.database.connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE geolocation_icons
+                        SET local_name = %s, content_type = %s, updated_at = now()
+                        WHERE id = %s
+                        """,
+                        (name, mime, row["icon_id"]),
+                    )
+            except Exception as exc:
+                log.warning("Could not cache GeoConfirmed icon %s: %s", row["icon_id"], exc)
+
+    def get_icon(self, icon_id):
+        if not UUID_RE.fullmatch(icon_id):
+            return None
+        with self.database.connect(dict_rows=True) as conn:
+            row = conn.execute(
+                "SELECT local_name, content_type FROM geolocation_icons WHERE id = %s",
+                (icon_id,),
+            ).fetchone()
+        if not row or not row["local_name"]:
+            return None
+        path = self.icon_dir / row["local_name"]
+        return (path, row["content_type"] or "image/png") if path.is_file() else None
+
+    def get_events_for_date(self, event_date, **filters):
+        south, north, west, east = UKRAINE_NEAR_BOUNDS
+        clauses = [
+            "event_date = %s",
+            "location && ST_MakeEnvelope(%s, %s, %s, %s, 4326)",
+        ]
+        values = [event_date, west, south, east, north]
+        for key, column in {"faction": "faction_id", "icon": "icon_id", "origin": "origin"}.items():
+            if filters.get(key):
+                clauses.append(f"{column} = %s")
+                values.append(str(filters[key]))
+        if filters.get("q"):
+            clauses.append("(strpos(lower(description), lower(%s)) > 0 OR strpos(lower(equipment), lower(%s)) > 0 OR strpos(lower(units), lower(%s)) > 0)")
+            value = str(filters["q"])
+            values.extend([value] * 3)
+        with self.database.connect(dict_rows=True) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT geolocation_events.*, ST_Y(location) AS lat, ST_X(location) AS lon
+                FROM geolocation_events WHERE {' AND '.join(clauses)}
+                ORDER BY timestamp_text DESC, uuid
+                """,
+                values,
+            ).fetchall()
+        return [self._event_pg(row) for row in rows]
+
+    def get_detail(self, uuid):
+        if not UUID_RE.fullmatch(uuid):
+            return None
+        south, north, west, east = UKRAINE_NEAR_BOUNDS
+        with self.database.connect(dict_rows=True) as conn:
+            row = conn.execute(
+                """
+                SELECT geolocation_events.*, ST_Y(location) AS lat, ST_X(location) AS lon
+                FROM geolocation_events
+                WHERE uuid = %s AND location && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
+                """,
+                (uuid, west, south, east, north),
+            ).fetchone()
+        return self._event_pg(row, True) if row else None
+
+    def get_all(self, selected_date=None, **filters):
+        if selected_date is not None and not re.fullmatch(r"\d{8}", selected_date):
+            raise ValueError("date must use YYYYMMDD format")
+        dates, cursor = [], self.retention_start
+        while cursor <= self.today():
+            dates.append(cursor.strftime("%Y%m%d"))
+            cursor += timedelta(days=1)
+        selected = selected_date or dates[-1]
+        if selected not in dates:
+            raise ValueError(f"geolocation date is not available: {selected}")
+        selected_day = datetime.strptime(selected, "%Y%m%d").date()
+        events = self.get_events_for_date(selected_day, **filters)
+        south, north, west, east = UKRAINE_NEAR_BOUNDS
+        with self.database.connect(dict_rows=True) as conn:
+            count_rows = conn.execute(
+                """
+                SELECT event_date, count(*) AS count FROM geolocation_events
+                WHERE location && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
+                GROUP BY event_date
+                """,
+                (west, south, east, north),
+            ).fetchall()
+            counts = {row["event_date"].strftime("%Y%m%d"): row["count"] for row in count_rows}
+            last_raw = self._meta_pg(conn, "last_sync")
+            stored_error = self._meta_pg(conn, "last_error") or None
+            total = conn.execute(
+                """
+                SELECT count(*) FROM geolocation_events
+                WHERE location && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
+                """,
+                (west, south, east, north),
+            ).fetchone()["count"]
+        last = float(last_raw or 0) or None
+        factions = sorted({(event["faction_id"], event["faction_name"], event["faction_color"]) for event in events})
+        icons = sorted({(event["icon_id"], event["icon_name"] or "Uncategorized") for event in events if event["icon_id"]})
+        origins = sorted({event["origin"] for event in events if event["origin"]})
+        active_error = stored_error or self._last_error
+        status = "stale" if active_error and total else "error" if active_error else "ok" if total else "empty"
+        return {
+            "date": selected, "dates": dates,
+            "daily_counts": {day: counts.get(day, 0) for day in dates},
+            "events": events,
+            "filters": {
+                "factions": [{"id": item[0], "name": item[1], "color": item[2]} for item in factions],
+                "icons": [{"id": item[0], "name": item[1]} for item in icons],
+                "origins": origins,
+            },
+            "sources": [{
+                "id": self.id, "display_name": self.display_name,
+                "event_count": len(events), "retained_event_count": total,
+                "last_updated": last, "status": status,
+            }],
+        }
+
+
 class GeolocationsService:
-    def __init__(self, source=None): self.source, self._thread, self._stop = source or GeoConfirmedGeolocationsSource(), None, threading.Event()
+    def __init__(self, source=None, *, read_only=False, use_postgis=None):
+        if source is None:
+            try:
+                from .database import postgis_enabled
+            except ImportError:
+                from database import postgis_enabled
+            enabled = postgis_enabled() if use_postgis is None else use_postgis
+            source = (
+                PostGISGeoConfirmedGeolocationsSource(read_only=read_only)
+                if enabled
+                else GeoConfirmedGeolocationsSource()
+            )
+        self.source, self._thread, self._stop = source, None, threading.Event()
     def start(self):
         self.source.load_cache()
+        if getattr(self.source, "read_only", False): return
         if self._thread and self._thread.is_alive(): return
         self._thread = threading.Thread(target=self._loop, daemon=True, name="geoconfirmed-sync"); self._thread.start()
     def stop(self):

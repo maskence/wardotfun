@@ -1,0 +1,18 @@
+[Unit]
+Description=Nightly wardotfun PostgreSQL backup
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=wardotfun
+Group=wardotfun
+EnvironmentFile=/etc/wardotfun/wardotfun.env
+ExecStart=/opt/wardotfun/deploy/backup_postgres.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/wardotfun-postgres

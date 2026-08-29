@@ -1,6 +1,16 @@
 # war.fun
 wardotfun is a website where people go to get info into ongoing wars and bet on it through prediction markets. 
 
+## Temporal maps
+
+The production-ready temporal path stores immutable mapper/fortification
+snapshots and GeoConfirmed events in PostGIS, serves viewport MVTs, and uses one
+global Kyiv-date calendar. It is guarded by shadow/read/vector flags; the
+pickle/SQLite routes remain a local and rollout fallback.
+
+- [Temporal API](docs/temporal-api.md)
+- [PostGIS provisioning and rollout runbook](docs/temporal-postgis-runbook.md)
+
 We will add multiple theatres eventually but we will start with Ukraine and especially territorial changes/strikes markets
 
 the basic interface will be centered around a map of ukraine with cities that host markets (capture or strikes) highlighted and clickable, you should have info on the market clicking on the city and eventually be able to bet on it.

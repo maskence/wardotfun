@@ -10,3 +10,4 @@ backend/data/*.lock
 
 backend/data/geoconfirmed.sqlite3*
 backend/data/geoconfirmed_icons/
+backend/data/raw_archive/

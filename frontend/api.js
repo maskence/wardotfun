@@ -8,6 +8,7 @@ window.API = (() => {
   // Begin core localhost requests before the external MapLibre script and
   // basemap styles load. Regular fetch methods below remain uncached for polling.
   const startup = {
+    mapState: request('/api/map-state'),
     mappers: request('/api/mappers'),
     cityMap: request('/api/city-market-map'),
     marketData: request('/api/market-data'),
@@ -16,6 +17,7 @@ window.API = (() => {
 
   return {
     startup,
+    fetchMapState: (date = null) => request(`/api/map-state${date ? `?date=${encodeURIComponent(date)}` : ''}`),
     fetchMappers: () => request('/api/mappers'),
     fetchMapperOverlay: (mapperId) => request(`/api/mapper-overlay?mapper=${encodeURIComponent(mapperId)}`),
     fetchFortifications: () => request('/api/fortifications'),

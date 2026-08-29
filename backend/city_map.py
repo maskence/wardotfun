@@ -2,7 +2,10 @@ import json
 import logging
 from pathlib import Path
 
-from geo_utils import city_geometry_to_geojson, city_geometry_to_marker
+try:
+    from .geo_utils import city_geometry_to_geojson, city_geometry_to_marker
+except ImportError:
+    from geo_utils import city_geometry_to_geojson, city_geometry_to_marker
 
 logger = logging.getLogger(__name__)
 

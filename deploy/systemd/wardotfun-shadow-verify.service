@@ -1,0 +1,15 @@
+[Unit]
+Description=Compare wardotfun legacy caches with PostGIS shadow snapshots
+After=wardotfun-ingest.service
+
+[Service]
+Type=oneshot
+User=wardotfun
+Group=wardotfun
+WorkingDirectory=/opt/wardotfun
+EnvironmentFile=/etc/wardotfun/wardotfun.env
+ExecStart=/opt/wardotfun/env/bin/python -m backend.shadow_verify --jsonl /var/lib/wardotfun/shadow-comparisons.jsonl
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wardotfun
