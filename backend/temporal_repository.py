@@ -6,6 +6,7 @@ import json
 import math
 import re
 import uuid
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -56,6 +57,7 @@ class IngestResult:
     snapshot_id: str | None
     content_hash: str
     feature_count: int
+    observation_id: str | None = None
 
 
 def parse_compact_date(value: str | None, *, default: date | None = None) -> date:
@@ -137,6 +139,68 @@ def content_hash(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def encode_change_cursor(observed_at: datetime, area_id: str) -> str:
+    raw = canonical_json([observed_at.isoformat(), str(area_id)]).encode("utf-8")
+    return urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_change_cursor(value: str | None) -> tuple[datetime, str] | None:
+    if not value:
+        return None
+    try:
+        raw = urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        timestamp, area_id = json.loads(raw)
+        parsed = datetime.fromisoformat(timestamp)
+        if parsed.tzinfo is None:
+            raise ValueError
+        return parsed, str(uuid.UUID(area_id))
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise TemporalDataError("invalid change-feed cursor") from exc
+
+
+def _mercator_xy(lon: float, lat: float) -> tuple[float, float]:
+    lat = max(-85.05112878, min(85.05112878, lat))
+    x = math.radians(lon) * 6378137.0
+    y = 6378137.0 * math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+    return x, y
+
+
+def _svg_geometry(geometry: dict[str, Any], project) -> str:
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+    if geometry_type == "Point":
+        x, y = project(coordinates)
+        return f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5"/>'
+    if geometry_type == "MultiPoint":
+        return "".join(
+            f'<circle cx="{project(point)[0]:.1f}" cy="{project(point)[1]:.1f}" r="5"/>'
+            for point in coordinates
+        )
+
+    def path(points, close=False):
+        if not points:
+            return ""
+        projected = [project(point) for point in points]
+        commands = [f"M{projected[0][0]:.1f},{projected[0][1]:.1f}"]
+        commands.extend(f"L{x:.1f},{y:.1f}" for x, y in projected[1:])
+        if close:
+            commands.append("Z")
+        return " ".join(commands)
+
+    paths: list[str] = []
+    if geometry_type == "LineString":
+        paths.append(path(coordinates))
+    elif geometry_type == "MultiLineString":
+        paths.extend(path(line) for line in coordinates)
+    elif geometry_type == "Polygon":
+        paths.extend(path(ring, True) for ring in coordinates)
+    elif geometry_type == "MultiPolygon":
+        paths.extend(path(ring, True) for polygon in coordinates for ring in polygon)
+    elif geometry_type == "GeometryCollection":
+        return "".join(_svg_geometry(child, project) for child in geometry.get("geometries", []))
+    return "".join(f'<path d="{value}"/>' for value in paths if value)
+
+
 def _slug(value: Any) -> str:
     result = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
     return result[:160] or "unnamed"
@@ -205,6 +269,20 @@ def geometry_centroid(geometry: dict[str, Any]) -> tuple[float, float]:
     return (
         sum(point[0] for point in points) / len(points),
         sum(point[1] for point in points) / len(points),
+    )
+
+
+def geometry_bounds_center(geometry: dict[str, Any]) -> tuple[float, float]:
+    """Return the bounding-box center used by PostGIS candidate matching."""
+    if geometry.get("type") == "GeometryCollection":
+        points = [point for child in geometry.get("geometries", []) for point in _coordinate_pairs(child.get("coordinates", []))]
+    else:
+        points = list(_coordinate_pairs(geometry.get("coordinates", [])))
+    if not points:
+        return (0.0, 0.0)
+    return (
+        (min(point[0] for point in points) + max(point[0] for point in points)) / 2,
+        (min(point[1] for point in points) + max(point[1] for point in points)) / 2,
     )
 
 
@@ -400,13 +478,13 @@ class TemporalMapRepository:
         rows = conn.execute(
             """
             WITH latest AS (
-                SELECT id FROM map_snapshots
+                SELECT snapshot_id AS id FROM map_snapshot_observations
                 WHERE source_id = %s
-                ORDER BY captured_at DESC, created_at DESC, id DESC LIMIT 1
+                ORDER BY observed_at DESC, id DESC LIMIT 1
             )
-            SELECT fv.logical_key,
-                   ST_X(ST_Centroid(fv.geometry)) AS lon,
-                   ST_Y(ST_Centroid(fv.geometry)) AS lat
+            SELECT fv.logical_key, fv.content_hash,
+                   (ST_XMin(box3d(fv.geometry)) + ST_XMax(box3d(fv.geometry))) / 2 AS lon,
+                   (ST_YMin(box3d(fv.geometry)) + ST_YMax(box3d(fv.geometry))) / 2 AS lat
             FROM latest
             JOIN snapshot_features sf ON sf.snapshot_id = latest.id
             JOIN feature_versions fv ON fv.id = sf.feature_version_id
@@ -415,9 +493,10 @@ class TemporalMapRepository:
             (source_id, bases),
         ).fetchall()
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for logical_key, lon, lat in rows:
+        for row in rows:
+            logical_key = row["logical_key"]
             grouped[logical_key.split("#", 1)[0]].append(
-                {"key": logical_key, "centroid": (float(lon), float(lat))}
+                {"key": logical_key, "content_hash": row["content_hash"], "center": (float(row["lon"]), float(row["lat"]))}
             )
         return grouped
 
@@ -443,7 +522,7 @@ class TemporalMapRepository:
                         "content_hash": digest,
                         "geometry": geometry,
                         "properties": properties,
-                        "centroid": geometry_centroid(geometry),
+                        "center": geometry_bounds_center(geometry),
                     }
                 )
             provisional.append(
@@ -471,14 +550,27 @@ class TemporalMapRepository:
             available = list(previous.get(base, []))
             stable_group = all(item["confidence"] >= 0.95 for item in items)
             used_keys: set[str] = set()
-            # Deterministic input order makes matching/replays reproducible.
-            for item in sorted(items, key=lambda value: value["content_hash"]):
+            # KML may reorder same-name placemarks. Preserve exact content first.
+            ordered = sorted(items, key=lambda value: value["content_hash"])
+            unmatched = []
+            for item in ordered:
+                exact = next((old for old in available if old["content_hash"] == item["content_hash"]), None)
+                if exact is None:
+                    unmatched.append(item)
+                    continue
+                available.remove(exact)
+                item["logical_key"] = exact["key"]
+                item["confidence"] = min(item["confidence"], 0.9 if stable_group else 0.65)
+                used_keys.add(item["logical_key"])
+
+            # Spatially reconcile only features whose actual content changed.
+            for item in unmatched:
                 if available:
-                    lon, lat = item["centroid"]
+                    lon, lat = item["center"]
                     nearest = min(
                         available,
-                        key=lambda old: (old["centroid"][0] - lon) ** 2
-                        + (old["centroid"][1] - lat) ** 2,
+                        key=lambda old: (old["center"][0] - lon) ** 2
+                        + (old["center"][1] - lat) ** 2,
                     )
                     available.remove(nearest)
                     item["logical_key"] = nearest["key"]
@@ -495,6 +587,340 @@ class TemporalMapRepository:
                 used_keys.add(item["logical_key"])
 
         return provisional
+
+    @staticmethod
+    def _create_change_areas(conn, observation_id: str, style_count: int) -> None:
+        clusters = conn.execute(
+            """
+            WITH pieces AS (
+                SELECT mcf.logical_key, mcf.change_type, dumped.geom AS bounds
+                FROM map_change_features mcf
+                CROSS JOIN LATERAL ST_Dump(mcf.bounds) dumped
+                WHERE mcf.observation_id = %s
+                  AND NOT ST_IsEmpty(dumped.geom)
+            ), clustered AS (
+                SELECT pieces.*,
+                       ST_ClusterDBSCAN(
+                           ST_Transform(ST_PointOnSurface(bounds), 3857), 50000, 1
+                       ) OVER (ORDER BY logical_key, change_type, md5(ST_AsEWKB(bounds))) AS cluster_id
+                FROM pieces
+            ), members AS (
+                SELECT DISTINCT cluster_id, logical_key, change_type FROM clustered
+            ), grouped AS (
+                SELECT clustered.cluster_id, ST_Envelope(ST_Collect(clustered.bounds)) AS bounds,
+                       count(DISTINCT (members.logical_key, members.change_type)) FILTER (WHERE members.change_type = 'added')::integer AS added_count,
+                       count(DISTINCT (members.logical_key, members.change_type)) FILTER (WHERE members.change_type = 'removed')::integer AS removed_count,
+                       count(DISTINCT (members.logical_key, members.change_type)) FILTER (WHERE members.change_type = 'modified')::integer AS modified_count,
+                       jsonb_agg(DISTINCT jsonb_build_array(members.logical_key, members.change_type)
+                                 ORDER BY jsonb_build_array(members.logical_key, members.change_type)) AS members
+                FROM clustered
+                JOIN members USING(cluster_id, logical_key, change_type)
+                GROUP BY clustered.cluster_id
+            )
+            SELECT ST_AsGeoJSON(bounds) AS bounds, added_count, removed_count,
+                   modified_count, members
+            FROM grouped
+            ORDER BY ST_XMin(box3d(bounds)), ST_YMin(box3d(bounds)),
+                     ST_XMax(box3d(bounds)), ST_YMax(box3d(bounds))
+            """,
+            (observation_id,),
+        ).fetchall()
+        ordinal = 0
+        for row in clusters:
+            area_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"wardotfun:change:v2:{observation_id}:{ordinal}"))
+            conn.execute(
+                """
+                INSERT INTO map_change_areas(
+                    id, observation_id, ordinal, bounds,
+                    added_count, removed_count, modified_count, style_count
+                ) VALUES (
+                    %s, %s, %s, ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326),
+                    %s, %s, %s, 0
+                )
+                """,
+                (
+                    area_id, observation_id, ordinal, row["bounds"],
+                    row["added_count"], row["removed_count"], row["modified_count"],
+                ),
+            )
+            with conn.cursor() as cursor:
+                cursor.executemany(
+                    """
+                    INSERT INTO map_change_area_features(
+                        area_id, observation_id, logical_key, change_type
+                    ) VALUES (%s, %s, %s, %s)
+                    """,
+                    [(area_id, observation_id, member[0], member[1]) for member in row["members"]],
+                )
+            ordinal += 1
+        if style_count:
+            row = conn.execute(
+                """
+                SELECT ST_AsGeoJSON(ST_Envelope(COALESCE(n.bounds, o.bounds))) AS bounds
+                FROM map_snapshot_observations observation
+                LEFT JOIN map_snapshots n ON n.id = observation.snapshot_id
+                LEFT JOIN map_snapshots o ON o.id = observation.previous_snapshot_id
+                WHERE observation.id = %s
+                """,
+                (observation_id,),
+            ).fetchone()
+            if row and row["bounds"]:
+                area_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"wardotfun:change:v2:{observation_id}:{ordinal}"))
+                conn.execute(
+                    """
+                    INSERT INTO map_change_areas(
+                        id, observation_id, ordinal, bounds, style_count
+                    ) VALUES (
+                        %s, %s, %s, ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326), %s
+                    )
+                    """,
+                    (area_id, observation_id, ordinal, row["bounds"], style_count),
+                )
+
+    def _create_observation(
+        self,
+        conn,
+        *,
+        source_id: str,
+        snapshot_id: str,
+        previous_snapshot_id: str | None,
+        observed_at: datetime,
+        ingest_run_id: int | None,
+    ) -> str:
+        observation_id = str(uuid.uuid4())
+        baseline = previous_snapshot_id is None
+        if baseline:
+            stats = {
+                "added_count": 0, "removed_count": 0, "modified_count": 0,
+                "style_count": 0, "bounds": None,
+            }
+        else:
+            stats = conn.execute(
+                """
+                WITH feature_stats AS (
+                    SELECT count(*) FILTER (WHERE change_type = 'added')::integer AS added_count,
+                           count(*) FILTER (WHERE change_type = 'removed')::integer AS removed_count,
+                           count(*) FILTER (WHERE change_type = 'modified')::integer AS modified_count,
+                           ST_Envelope(ST_Collect(bounds)) AS bounds
+                    FROM map_snapshot_feature_diff(%s, %s)
+                ), old_layers AS (
+                    SELECT layer_key, label, geometry_type, paint
+                    FROM map_layer_versions WHERE snapshot_id = %s
+                ), new_layers AS (
+                    SELECT layer_key, label, geometry_type, paint
+                    FROM map_layer_versions WHERE snapshot_id = %s
+                ), style_stats AS (
+                    SELECT count(*)::integer AS style_count
+                    FROM old_layers o FULL JOIN new_layers n USING(layer_key)
+                    WHERE o.layer_key IS NULL OR n.layer_key IS NULL
+                       OR o.label IS DISTINCT FROM n.label
+                       OR o.geometry_type IS DISTINCT FROM n.geometry_type
+                       OR o.paint IS DISTINCT FROM n.paint
+                )
+                SELECT feature_stats.added_count, feature_stats.removed_count,
+                       feature_stats.modified_count, style_stats.style_count,
+                       ST_AsGeoJSON(feature_stats.bounds) AS bounds
+                FROM feature_stats CROSS JOIN style_stats
+                """,
+                (previous_snapshot_id, snapshot_id, previous_snapshot_id, snapshot_id),
+            ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO map_snapshot_observations(
+                id, source_id, snapshot_id, previous_snapshot_id, ingest_run_id,
+                observed_at, calendar_date, is_baseline,
+                added_count, removed_count, modified_count, style_count, bounds
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                CASE WHEN %s::text IS NULL THEN NULL
+                     ELSE ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326) END
+            )
+            """,
+            (
+                observation_id, source_id, snapshot_id, previous_snapshot_id,
+                ingest_run_id, observed_at, kyiv_calendar_date(observed_at), baseline,
+                stats["added_count"], stats["removed_count"], stats["modified_count"],
+                stats["style_count"], stats["bounds"], stats["bounds"],
+            ),
+        )
+        if not baseline:
+            conn.execute(
+                """
+                INSERT INTO map_change_features(
+                    observation_id, logical_key, change_type,
+                    old_feature_version_id, new_feature_version_id,
+                    old_layer_key, new_layer_key, identity_confidence, bounds
+                )
+                SELECT %s, logical_key, change_type, old_feature_version_id,
+                       new_feature_version_id, old_layer_key, new_layer_key,
+                       identity_confidence, bounds
+                FROM map_snapshot_feature_diff(%s, %s)
+                """,
+                (observation_id, previous_snapshot_id, snapshot_id),
+            )
+            self._create_change_areas(conn, observation_id, stats["style_count"])
+        return observation_id
+
+    def backfill_change_observations(self) -> dict[str, int]:
+        """Idempotently reconstruct the observable timeline from stored snapshots."""
+        created_observations = 0
+        created_areas = 0
+        with self.database.connect(dict_rows=True) as conn:
+            sources = conn.execute("SELECT id FROM map_sources ORDER BY id").fetchall()
+            for source in sources:
+                source_id = source["id"]
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"wardotfun:ingest:{source_id}",),
+                )
+                existing = conn.execute(
+                    "SELECT count(*) AS count FROM map_snapshot_observations WHERE source_id = %s",
+                    (source_id,),
+                ).fetchone()["count"]
+                if existing:
+                    conn.commit()
+                    continue
+                snapshots = conn.execute(
+                    """
+                    SELECT id, ingest_run_id, captured_at FROM map_snapshots
+                    WHERE source_id = %s
+                    ORDER BY captured_at, created_at, id
+                    """,
+                    (source_id,),
+                ).fetchall()
+                previous = None
+                for snapshot in snapshots:
+                    observation_id = self._create_observation(
+                        conn,
+                        source_id=source_id,
+                        snapshot_id=str(snapshot["id"]),
+                        previous_snapshot_id=previous,
+                        observed_at=snapshot["captured_at"],
+                        ingest_run_id=snapshot["ingest_run_id"],
+                    )
+                    created_observations += 1
+                    created_areas += conn.execute(
+                        "SELECT count(*) AS count FROM map_change_areas WHERE observation_id = %s",
+                        (observation_id,),
+                    ).fetchone()["count"]
+                    previous = str(snapshot["id"])
+                conn.commit()
+        return {"observations": created_observations, "areas": created_areas}
+
+    def rebuild_change_derivatives(self) -> dict[str, int]:
+        """Transactionally rebuild v2 changes while preserving observations."""
+        areas = 0
+        features = 0
+        with self.database.connect(dict_rows=True) as conn:
+            source_rows = conn.execute("SELECT id FROM map_sources ORDER BY id").fetchall()
+            for source in source_rows:
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"wardotfun:ingest:{source['id']}",),
+                )
+            observations = conn.execute(
+                """
+                SELECT id, snapshot_id, previous_snapshot_id, is_baseline
+                FROM map_snapshot_observations
+                ORDER BY source_id, observed_at, id
+                """
+            ).fetchall()
+            for table, trigger in (
+                ("map_change_area_features", "map_change_area_features_immutable"),
+                ("map_change_areas", "map_change_areas_immutable"),
+                ("map_change_features", "map_change_features_immutable"),
+                ("map_snapshot_observations", "map_snapshot_observations_immutable"),
+            ):
+                conn.execute(f"ALTER TABLE {table} DISABLE TRIGGER {trigger}")
+            conn.execute("DELETE FROM map_change_area_features")
+            conn.execute("DELETE FROM map_change_areas")
+            conn.execute("DELETE FROM map_change_features")
+            for observation in observations:
+                observation_id = str(observation["id"])
+                old_snapshot = observation["previous_snapshot_id"]
+                new_snapshot = observation["snapshot_id"]
+                if observation["is_baseline"] or old_snapshot is None:
+                    stats = {
+                        "added_count": 0, "removed_count": 0,
+                        "modified_count": 0, "style_count": 0, "bounds": None,
+                    }
+                else:
+                    stats = conn.execute(
+                        """
+                        WITH feature_stats AS (
+                            SELECT count(*) FILTER (WHERE change_type = 'added')::integer AS added_count,
+                                   count(*) FILTER (WHERE change_type = 'removed')::integer AS removed_count,
+                                   count(*) FILTER (WHERE change_type = 'modified')::integer AS modified_count,
+                                   ST_Envelope(ST_Collect(bounds)) AS bounds
+                            FROM map_snapshot_feature_diff(%s, %s)
+                        ), old_layers AS (
+                            SELECT layer_key, label, geometry_type, paint
+                            FROM map_layer_versions WHERE snapshot_id = %s
+                        ), new_layers AS (
+                            SELECT layer_key, label, geometry_type, paint
+                            FROM map_layer_versions WHERE snapshot_id = %s
+                        ), style_stats AS (
+                            SELECT count(*)::integer AS style_count
+                            FROM old_layers o FULL JOIN new_layers n USING(layer_key)
+                            WHERE o.layer_key IS NULL OR n.layer_key IS NULL
+                               OR o.label IS DISTINCT FROM n.label
+                               OR o.geometry_type IS DISTINCT FROM n.geometry_type
+                               OR o.paint IS DISTINCT FROM n.paint
+                        )
+                        SELECT feature_stats.added_count, feature_stats.removed_count,
+                               feature_stats.modified_count, style_stats.style_count,
+                               ST_AsGeoJSON(feature_stats.bounds) AS bounds
+                        FROM feature_stats CROSS JOIN style_stats
+                        """,
+                        (old_snapshot, new_snapshot, old_snapshot, new_snapshot),
+                    ).fetchone()
+                conn.execute(
+                    """
+                    UPDATE map_snapshot_observations SET
+                        added_count = %s, removed_count = %s, modified_count = %s,
+                        style_count = %s,
+                        bounds = CASE WHEN %s::text IS NULL THEN NULL
+                          ELSE ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326) END
+                    WHERE id = %s
+                    """,
+                    (
+                        stats["added_count"], stats["removed_count"],
+                        stats["modified_count"], stats["style_count"],
+                        stats["bounds"], stats["bounds"], observation_id,
+                    ),
+                )
+                if observation["is_baseline"] or old_snapshot is None:
+                    continue
+                inserted = conn.execute(
+                    """
+                    INSERT INTO map_change_features(
+                        observation_id, logical_key, change_type,
+                        old_feature_version_id, new_feature_version_id,
+                        old_layer_key, new_layer_key, identity_confidence, bounds
+                    )
+                    SELECT %s, logical_key, change_type, old_feature_version_id,
+                           new_feature_version_id, old_layer_key, new_layer_key,
+                           identity_confidence, bounds
+                    FROM map_snapshot_feature_diff(%s, %s)
+                    """,
+                    (observation_id, old_snapshot, new_snapshot),
+                ).rowcount
+                features += max(inserted, 0)
+                self._create_change_areas(conn, observation_id, stats["style_count"])
+                areas += conn.execute(
+                    "SELECT count(*) AS count FROM map_change_areas WHERE observation_id = %s",
+                    (observation_id,),
+                ).fetchone()["count"]
+            for table, trigger in reversed((
+                ("map_change_area_features", "map_change_area_features_immutable"),
+                ("map_change_areas", "map_change_areas_immutable"),
+                ("map_change_features", "map_change_features_immutable"),
+                ("map_snapshot_observations", "map_snapshot_observations_immutable"),
+            )):
+                conn.execute(f"ALTER TABLE {table} ENABLE TRIGGER {trigger}")
+            conn.commit()
+        return {"observations": len(observations), "features": features, "areas": areas}
 
     def ingest_overlay(
         self,
@@ -531,11 +957,22 @@ class TemporalMapRepository:
                     )
                     return IngestResult(run_id, "locked", None, digest, count)
 
+                latest_observation = conn.execute(
+                    """
+                    SELECT id, snapshot_id FROM map_snapshot_observations
+                    WHERE source_id = %s
+                    ORDER BY observed_at DESC, id DESC LIMIT 1
+                    """,
+                    (source_id,),
+                ).fetchone()
+                previous_snapshot_id = (
+                    str(latest_observation["snapshot_id"]) if latest_observation else None
+                )
                 existing = conn.execute(
                     "SELECT id FROM map_snapshots WHERE source_id = %s AND content_hash = %s",
                     (source_id, digest),
                 ).fetchone()
-                if existing:
+                if existing and str(existing["id"]) == previous_snapshot_id:
                     conn.commit()
                     snapshot_id = str(existing["id"])
                     self._finish_run(
@@ -547,6 +984,29 @@ class TemporalMapRepository:
                         raw_records=raw_records,
                     )
                     return IngestResult(run_id, "unchanged", snapshot_id, digest, count)
+
+                if existing:
+                    snapshot_id = str(existing["id"])
+                    observation_id = self._create_observation(
+                        conn,
+                        source_id=source_id,
+                        snapshot_id=snapshot_id,
+                        previous_snapshot_id=previous_snapshot_id,
+                        observed_at=captured_at,
+                        ingest_run_id=run_id,
+                    )
+                    conn.commit()
+                    self._finish_run(
+                        run_id,
+                        status="stored",
+                        normalized_hash=digest,
+                        snapshot_id=snapshot_id,
+                        feature_count=count,
+                        raw_records=raw_records,
+                    )
+                    return IngestResult(
+                        run_id, "stored", snapshot_id, digest, count, observation_id
+                    )
 
                 prepared_layers = self._prepare_layers(conn, source_id, payload)
                 all_geometries = [
@@ -635,6 +1095,14 @@ class TemporalMapRepository:
                             """,
                             (snapshot_id, layer_id, feature_id),
                         )
+                observation_id = self._create_observation(
+                    conn,
+                    source_id=source_id,
+                    snapshot_id=snapshot_id,
+                    previous_snapshot_id=previous_snapshot_id,
+                    observed_at=captured_at,
+                    ingest_run_id=run_id,
+                )
                 conn.commit()
 
             self._finish_run(
@@ -645,7 +1113,9 @@ class TemporalMapRepository:
                 feature_count=count,
                 raw_records=raw_records,
             )
-            return IngestResult(run_id, "stored", snapshot_id, digest, count)
+            return IngestResult(
+                run_id, "stored", snapshot_id, digest, count, observation_id
+            )
         except Exception as exc:
             self._finish_run(
                 run_id,
@@ -662,7 +1132,7 @@ class TemporalMapRepository:
         selected_date = parse_compact_date(selected, default=today)
         with self.database.connect(dict_rows=True) as conn:
             first_snapshot = conn.execute(
-                "SELECT min(calendar_date) AS value FROM map_snapshots"
+                "SELECT min(calendar_date) AS value FROM map_snapshot_observations"
             ).fetchone()["value"]
             retention_row = conn.execute(
                 "SELECT value FROM geolocation_metadata WHERE key = 'retention_start'"
@@ -685,19 +1155,20 @@ class TemporalMapRepository:
             rows = conn.execute(
                 """
                 SELECT s.id, s.kind, s.display_name, s.source_url, s.attribution,
-                       snap.id AS snapshot_id, snap.captured_at,
-                       snap.calendar_date AS snapshot_date,
+                       snap.id AS snapshot_id, observation.observed_at AS captured_at,
+                       observation.calendar_date AS snapshot_date,
                        snap.feature_count, snap.content_hash,
                        latest_run.status AS ingest_status,
                        latest_run.finished_at AS ingest_finished_at,
                        latest_run.error AS ingest_error
                 FROM map_sources s
                 LEFT JOIN LATERAL (
-                    SELECT ms.* FROM map_snapshots ms
-                    WHERE ms.source_id = s.id
-                      AND ms.captured_at < ((%s::date + 1)::timestamp AT TIME ZONE 'Europe/Kyiv')
-                    ORDER BY ms.captured_at DESC, ms.created_at DESC, ms.id DESC LIMIT 1
-                ) snap ON true
+                    SELECT observed.* FROM map_snapshot_observations observed
+                    WHERE observed.source_id = s.id
+                      AND observed.observed_at < ((%s::date + 1)::timestamp AT TIME ZONE 'Europe/Kyiv')
+                    ORDER BY observed.observed_at DESC, observed.id DESC LIMIT 1
+                ) observation ON true
+                LEFT JOIN map_snapshots snap ON snap.id = observation.snapshot_id
                 LEFT JOIN LATERAL (
                     SELECT ir.status, ir.finished_at, ir.error FROM ingest_runs ir
                     WHERE ir.source_id = s.id
@@ -806,6 +1277,311 @@ class TemporalMapRepository:
                 "error": geo_error["value"] if geo_error and geo_error["value"] else None,
             },
         }
+
+    @staticmethod
+    def _change_item(row) -> dict[str, Any]:
+        return {
+            "id": str(row["area_id"]),
+            "observation_id": str(row["observation_id"]),
+            "source": {
+                "id": row["source_id"], "kind": row["kind"],
+                "display_name": row["display_name"],
+            },
+            "observed_at": row["observed_at"].isoformat(),
+            "date": row["calendar_date"].strftime("%Y%m%d"),
+            "counts": {
+                "added": row["added_count"], "removed": row["removed_count"],
+                "modified": row["modified_count"], "style": row["style_count"],
+            },
+            "bounds": [row["west"], row["south"], row["east"], row["north"]],
+            "thumbnail_url": f"/api/map-change-images/v2/{row['area_id']}.svg",
+            "detail_url": f"/api/map-changes/{row['area_id']}",
+            "cursor": encode_change_cursor(row["observed_at"], str(row["area_id"])),
+        }
+
+    def get_map_changes(
+        self,
+        *,
+        selected: str | None = None,
+        source_id: str | None = None,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        if not 1 <= limit <= 50:
+            raise TemporalDataError("change-feed limit must be between 1 and 50")
+        if source_id and not SOURCE_RE.fullmatch(source_id):
+            raise TemporalDataError("invalid change-feed source")
+        selected_date = parse_compact_date(selected, default=datetime.now(KYIV).date())
+        if selected_date > datetime.now(KYIV).date():
+            raise TemporalDataError("change-feed date cannot be in the future")
+        cutoff = datetime.combine(selected_date + timedelta(days=1), datetime.min.time(), KYIV)
+        decoded = decode_change_cursor(cursor)
+        cursor_time, cursor_id = decoded if decoded else (None, None)
+        with self.database.connect(dict_rows=True) as conn:
+            rows = conn.execute(
+                """
+                SELECT area.id AS area_id, observation.id AS observation_id,
+                       observation.observed_at, observation.calendar_date,
+                       source.id AS source_id, source.kind, source.display_name,
+                       area.added_count, area.removed_count, area.modified_count,
+                       area.style_count,
+                       ST_XMin(box3d(area.bounds)) AS west, ST_YMin(box3d(area.bounds)) AS south,
+                       ST_XMax(box3d(area.bounds)) AS east, ST_YMax(box3d(area.bounds)) AS north
+                FROM map_change_areas area
+                JOIN map_snapshot_observations observation ON observation.id = area.observation_id
+                JOIN map_sources source ON source.id = observation.source_id
+                WHERE observation.observed_at < %s
+                  AND source.enabled
+                  AND (%s::text IS NULL OR source.id = %s)
+                  AND (%s::timestamptz IS NULL OR
+                       (observation.observed_at, area.id) < (%s::timestamptz, %s::uuid))
+                ORDER BY observation.observed_at DESC, area.id DESC
+                LIMIT %s
+                """,
+                (
+                    cutoff, source_id, source_id, cursor_time, cursor_time,
+                    cursor_id, limit + 1,
+                ),
+            ).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        items = [self._change_item(row) for row in rows]
+        return {
+            "date": selected_date.strftime("%Y%m%d"),
+            "timezone": "Europe/Kyiv",
+            "items": items,
+            "next_cursor": items[-1]["cursor"] if has_more and items else None,
+        }
+
+    def get_map_change_status(
+        self, *, selected: str | None = None, after: str | None = None
+    ) -> dict[str, Any]:
+        selected_date = parse_compact_date(selected, default=datetime.now(KYIV).date())
+        if selected_date > datetime.now(KYIV).date():
+            raise TemporalDataError("change-feed date cannot be in the future")
+        cutoff = datetime.combine(selected_date + timedelta(days=1), datetime.min.time(), KYIV)
+        decoded = decode_change_cursor(after)
+        after_time, after_id = decoded if decoded else (None, None)
+        with self.database.connect(dict_rows=True) as conn:
+            latest = conn.execute(
+                """
+                SELECT observation.observed_at, area.id
+                FROM map_change_areas area
+                JOIN map_snapshot_observations observation ON observation.id = area.observation_id
+                JOIN map_sources source ON source.id = observation.source_id
+                WHERE observation.observed_at < %s AND source.enabled
+                ORDER BY observation.observed_at DESC, area.id DESC LIMIT 1
+                """,
+                (cutoff,),
+            ).fetchone()
+            if decoded:
+                unread = conn.execute(
+                    """
+                    SELECT LEAST(count(*), 100)::integer AS count
+                    FROM map_change_areas area
+                    JOIN map_snapshot_observations observation ON observation.id = area.observation_id
+                    JOIN map_sources source ON source.id = observation.source_id
+                    WHERE observation.observed_at < %s AND source.enabled
+                      AND (observation.observed_at, area.id) > (%s, %s::uuid)
+                    """,
+                    (cutoff, after_time, after_id),
+                ).fetchone()["count"]
+            else:
+                unread = 0
+        latest_cursor = (
+            encode_change_cursor(latest["observed_at"], str(latest["id"])) if latest else None
+        )
+        return {
+            "date": selected_date.strftime("%Y%m%d"),
+            "latest_cursor": latest_cursor,
+            "unread_count": unread,
+        }
+
+    @staticmethod
+    def _snapshot_descriptor(conn, source_id: str, snapshot_id) -> dict[str, Any] | None:
+        if not snapshot_id:
+            return None
+        snapshot_id = str(snapshot_id)
+        snapshot = conn.execute(
+            "SELECT feature_count, content_hash FROM map_snapshots WHERE id = %s",
+            (snapshot_id,),
+        ).fetchone()
+        layers = conn.execute(
+            """
+            SELECT layer_key, label, geometry_type, paint, feature_count
+            FROM map_layer_versions WHERE snapshot_id = %s ORDER BY ordinal
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        return {
+            "id": snapshot_id,
+            "feature_count": snapshot["feature_count"],
+            "content_hash": snapshot["content_hash"],
+            "tile_url": f"/api/map-tiles/{source_id}/{snapshot_id}/{{z}}/{{x}}/{{y}}.pbf",
+            "layers": [{
+                "id": layer["layer_key"], "label": layer["label"],
+                "geom_type": layer["geometry_type"], "paint": layer["paint"],
+                "feature_count": layer["feature_count"], "source_layer": "features",
+            } for layer in layers],
+        }
+
+    def get_map_change(self, area_id: str) -> dict[str, Any]:
+        try:
+            area_id = str(uuid.UUID(area_id))
+        except (ValueError, TypeError) as exc:
+            raise TemporalDataError("invalid map-change area") from exc
+        with self.database.connect(dict_rows=True) as conn:
+            row = conn.execute(
+                """
+                SELECT area.id AS area_id, observation.id AS observation_id,
+                       observation.source_id, observation.snapshot_id,
+                       observation.previous_snapshot_id, observation.observed_at,
+                       observation.calendar_date, source.kind, source.display_name,
+                       area.added_count, area.removed_count, area.modified_count,
+                       area.style_count,
+                       ST_XMin(box3d(area.bounds)) AS west, ST_YMin(box3d(area.bounds)) AS south,
+                       ST_XMax(box3d(area.bounds)) AS east, ST_YMax(box3d(area.bounds)) AS north
+                FROM map_change_areas area
+                JOIN map_snapshot_observations observation ON observation.id = area.observation_id
+                JOIN map_sources source ON source.id = observation.source_id
+                WHERE area.id = %s
+                """,
+                (area_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError("map-change area not found")
+            before = self._snapshot_descriptor(conn, row["source_id"], row["previous_snapshot_id"])
+            after = self._snapshot_descriptor(conn, row["source_id"], row["snapshot_id"])
+        item = self._change_item(row)
+        item.update({
+            "before": before,
+            "after": after,
+            "change_tile_url": f"/api/map-change-tiles/v2/{area_id}/{{z}}/{{x}}/{{y}}.pbf",
+        })
+        return item
+
+    def get_change_svg(self, area_id: str) -> tuple[bytes, str]:
+        detail = self.get_map_change(area_id)
+        west, south, east, north = detail["bounds"]
+        with self.database.connect(dict_rows=True) as conn:
+            rows = conn.execute(
+                """
+                WITH area AS (
+                    SELECT change_area.id, change_area.bounds, observation.snapshot_id,
+                           change_area.observation_id
+                    FROM map_change_areas change_area
+                    JOIN map_snapshot_observations observation
+                      ON observation.id = change_area.observation_id
+                    WHERE change_area.id = %s
+                ),
+                geometries AS (
+                    SELECT delta.change_type, delta.phase, delta.geometry
+                    FROM area
+                    CROSS JOIN LATERAL map_change_area_geometries(area.id) delta
+                    UNION ALL
+                    SELECT 'context'::text, 'after'::text, context.geometry
+                    FROM area
+                    JOIN LATERAL (
+                        SELECT fv.geometry
+                        FROM snapshot_features sf
+                        JOIN feature_versions fv ON fv.id = sf.feature_version_id
+                        WHERE sf.snapshot_id = area.snapshot_id
+                          AND fv.geometry && ST_Expand(area.bounds, 0.25)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM map_change_features changed
+                              WHERE changed.observation_id = area.observation_id
+                                AND fv.id IN (changed.old_feature_version_id, changed.new_feature_version_id)
+                          )
+                        ORDER BY fv.id LIMIT 2000
+                    ) context ON true
+                )
+                SELECT change_type, phase, ST_AsGeoJSON(geometry) AS geometry
+                FROM geometries
+                ORDER BY change_type, phase, md5(ST_AsEWKB(geometry))
+                """,
+                (area_id,),
+            ).fetchall()
+        min_x, min_y = _mercator_xy(west, south)
+        max_x, max_y = _mercator_xy(east, north)
+        span = max(max_x - min_x, max_y - min_y, 10000.0)
+        min_x -= span * 0.12; max_x += span * 0.12
+        min_y -= span * 0.12; max_y += span * 0.12
+        width, height = max_x - min_x, max_y - min_y
+        scale = min(600 / width, 320 / height)
+        offset_x = (640 - width * scale) / 2
+        offset_y = (360 - height * scale) / 2
+
+        def project(point):
+            x, y = _mercator_xy(float(point[0]), float(point[1]))
+            return offset_x + (x - min_x) * scale, 360 - (offset_y + (y - min_y) * scale)
+
+        groups: dict[tuple[str, str], list[str]] = defaultdict(list)
+        for row in rows:
+            groups[(row["change_type"], row["phase"])].append(
+                _svg_geometry(json.loads(row["geometry"]), project)
+            )
+        styles = {
+            ("context", "after"): "fill:#68717a;fill-opacity:.06;stroke:#68717a;stroke-opacity:.3;stroke-width:1",
+            ("added", "after"): "fill:#35c46a;fill-opacity:.35;stroke:#54e383;stroke-width:3",
+            ("removed", "before"): "fill:#e34b4b;fill-opacity:.22;stroke:#ff6868;stroke-width:3;stroke-dasharray:8 5",
+            ("modified", "before"): "fill:none;stroke:#e34b4b;stroke-opacity:.55;stroke-width:2;stroke-dasharray:6 5",
+            ("modified", "after"): "fill:#35c46a;fill-opacity:.35;stroke:#54e383;stroke-width:3",
+            ("modified", "style"): "fill:#d5a93d;fill-opacity:.28;stroke:#f0c75e;stroke-width:3",
+        }
+        layers = "".join(
+            f'<g style="{styles.get(key, "fill:none;stroke:#aaa")}">{"".join(values)}</g>'
+            for key, values in groups.items()
+        )
+        if detail["counts"]["style"]:
+            layers += '<rect x="120" y="72" width="400" height="216" rx="8" fill="none" stroke="#f0c75e" stroke-width="4"/><text x="320" y="188" text-anchor="middle" fill="#f0c75e" font-family="monospace" font-size="20">STYLE CHANGE</text>'
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360">'
+            '<rect width="640" height="360" fill="#111418"/>'
+            '<path d="M0 90H640M0 180H640M0 270H640M160 0V360M320 0V360M480 0V360" stroke="#293038" stroke-width="1"/>'
+            f'{layers}</svg>'
+        ).encode("utf-8")
+        etag = '"' + hashlib.sha256(b"change-svg-v2:" + svg).hexdigest() + '"'
+        return svg, etag
+
+    def get_change_tile(self, area_id: str, z: int, x: int, y: int) -> tuple[bytes, str]:
+        try:
+            area_id = str(uuid.UUID(area_id))
+        except (ValueError, TypeError) as exc:
+            raise TemporalDataError("invalid map-change area") from exc
+        if not 0 <= z <= 22:
+            raise TemporalDataError("zoom must be between 0 and 22")
+        limit = 1 << z
+        if not (0 <= x < limit and 0 <= y < limit):
+            raise TemporalDataError("tile coordinate is outside the zoom grid")
+        with self.database.connect() as conn:
+            exists = conn.execute("SELECT 1 FROM map_change_areas WHERE id = %s", (area_id,)).fetchone()
+            if not exists:
+                raise KeyError("map-change area not found")
+            row = conn.execute(
+                """
+                WITH tile_bounds AS (SELECT ST_TileEnvelope(%s, %s, %s) AS geom),
+                area AS (SELECT id, observation_id FROM map_change_areas WHERE id = %s),
+                change_geometries AS (
+                    SELECT delta.logical_key, delta.change_type, delta.phase, delta.geometry
+                    FROM area
+                    CROSS JOIN LATERAL map_change_area_geometries(area.id) delta
+                ), tile_rows AS (
+                    SELECT logical_key, change_type, phase,
+                           ST_AsMVTGeom(ST_Transform(geometry, 3857), tile_bounds.geom,
+                                        %s, %s, true) AS geom
+                    FROM change_geometries CROSS JOIN tile_bounds
+                    WHERE geometry && ST_Transform(tile_bounds.geom, 4326)
+                )
+                SELECT ST_AsMVT(tile_rows, 'changes', %s, 'geom')
+                FROM tile_rows WHERE geom IS NOT NULL
+                """,
+                (z, x, y, area_id, MVT_EXTENT, MVT_BUFFER, MVT_EXTENT),
+            ).fetchone()
+        tile = bytes(row[0]) if row and row[0] is not None else b""
+        etag = '"' + hashlib.sha256(
+            f"change-mvt-v2:{area_id}:{z}:{x}:{y}".encode("ascii")
+        ).hexdigest() + '"'
+        return tile, etag
 
     def get_tile(
         self,

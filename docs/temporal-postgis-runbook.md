@@ -130,11 +130,22 @@ blocks. Test with `nginx -t`, reload, and verify gzip/ETag behavior. Snapshot
 URLs are immutable and can be cached for one year; manifests remain
 revalidated.
 
+Create the observation timeline and resumably backfill every stored transition
+before enabling the drawer:
+
+```bash
+sudo -u wardotfun /opt/wardotfun/venv/bin/python -m backend.migrate --backfill-map-changes
+```
+
+Re-running the command is safe; sources with an observation timeline are
+skipped. The first snapshot is a baseline and does not create a feed card.
+
 Set the two flags in `/etc/wardotfun/wardotfun.env`:
 
 ```text
 WARDOTFUN_POSTGIS_READS_ENABLED=1
 WARDOTFUN_VECTOR_TILES_ENABLED=1
+WARDOTFUN_MAP_CHANGES_ENABLED=1
 ```
 
 Restart the wardotfun web service. Verify:
@@ -149,8 +160,10 @@ Restart the wardotfun web service. Verify:
 - market, city, and GeoConfirmed markers stay above geometry;
 - upstream blocking leaves the latest snapshot available with stale status;
 - nginx/browser caches serve repeated views.
+- map-change cards follow the global calendar, and Before/Changes/After uses
+  exact immutable snapshots without downloading whole-country GeoJSON;
 
-Rollback is immediate: set both flags back to `0` and restart the web service.
+Rollback is immediate: set all three flags back to `0` and restart the web service.
 The ingestion worker continues maintaining legacy caches during the observation
 week.
 

@@ -128,6 +128,19 @@
     };
   }
 
+  // MapLibre creates tile Requests inside a worker. Unlike window.fetch(), the
+  // Request constructor used there cannot resolve root-relative URL templates.
+  // Resolve API templates on the main thread while preserving {z}/{x}/{y}.
+  function absoluteTileUrl(template) {
+    if (!template) return template;
+    try {
+      return new URL(template, window.location.href).href
+        .replace(/%7B(z|x|y)%7D/gi, '{$1}');
+    } catch (_error) {
+      return template;
+    }
+  }
+
   const TILESETS = [
     { id: 'hybrid', label: 'Hybrid', group: 'Reference', getStyle: buildHybridStyle },
     { id: 'street', label: 'Street', group: 'Reference', getStyle: () => makeRasterStyle('osm', ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], '© OpenStreetMap') },
@@ -179,6 +192,9 @@
   let _startupInitialized = false;
   let _mapState = null;
   let _temporalMode = false;
+  let _changeComparison = null;
+  let _changeSourceId = null;
+  let _changeLayerIds = [];
   const _fortStyleLayersByDataId = new Map();
 
   // Start application data immediately. None of these requests should wait for
@@ -305,7 +321,8 @@
 
   function isApplicationLayer(id) {
     return id.startsWith('overlay-') || id.startsWith('fort-') ||
-      id.startsWith('cities-') || id.startsWith('targets-') || id.startsWith('geo-');
+      id.startsWith('change-') || id.startsWith('cities-') ||
+      id.startsWith('targets-') || id.startsWith('geo-');
   }
 
   function installBasemap(style) {
@@ -354,6 +371,7 @@
 
   async function switchMapper(id) {
     if (!id) return;
+    if (_changeComparison) exitChangeComparison();
     if (id === _activeMapperId && _overlayData?.mapper_id === id) return;
     if (_temporalMode) {
       const data = _mapState?.mappers?.find(mapper => mapper.id === id);
@@ -419,6 +437,7 @@
       addTargetLayers(_cityMap);
     }
     if (_fortData) addFortLayers(_fortData);
+    if (_changeComparison?.mode === 'changes') addChangeLayers(_changeComparison.detail);
   }
 
   function removeOverlayLayers() {
@@ -440,7 +459,7 @@
       const sourceId = `overlay-${payload.mapper_id}-${payload.snapshot_id}`;
       map.addSource(sourceId, {
         type: 'vector',
-        tiles: [payload.tile_url],
+        tiles: [absoluteTileUrl(payload.tile_url)],
         minzoom: 0,
         maxzoom: 14,
       });
@@ -595,7 +614,7 @@
       const sourceId = `fort-${data.snapshot_id}`;
       map.addSource(sourceId, {
         type: 'vector',
-        tiles: [data.tile_url],
+        tiles: [absoluteTileUrl(data.tile_url)],
         minzoom: 0,
         maxzoom: 14,
       });
@@ -624,6 +643,157 @@
       if (map.getLayer(layerId)) {
         map.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none');
       }
+    }
+  }
+
+  function removeChangeLayers() {
+    for (const id of [..._changeLayerIds].reverse()) {
+      if (map.getLayer(id)) map.removeLayer(id);
+    }
+    if (_changeSourceId && map.getSource(_changeSourceId)) map.removeSource(_changeSourceId);
+    _changeLayerIds = [];
+    _changeSourceId = null;
+  }
+
+  function addChangeLayers(detail) {
+    removeChangeLayers();
+    if (!detail?.change_tile_url) return;
+    _changeSourceId = `change-${detail.id}`;
+    map.addSource(_changeSourceId, {
+      type: 'vector', tiles: [absoluteTileUrl(detail.change_tile_url)], minzoom: 0, maxzoom: 14,
+    });
+    const variants = [
+      { key: 'added-after', type: 'added', phase: 'after', color: '#54e383', dash: null },
+      { key: 'removed-before', type: 'removed', phase: 'before', color: '#ff6868', dash: [3, 2] },
+      { key: 'modified-before', type: 'modified', phase: 'before', color: '#e34b4b', dash: [2, 2] },
+      { key: 'modified-after', type: 'modified', phase: 'after', color: '#54e383', dash: null },
+      { key: 'modified-style', type: 'modified', phase: 'style', color: '#f0c75e', dash: null },
+    ];
+    const before = _beforeCities();
+    for (const variant of variants) {
+      const commonFilter = [['==', ['get', 'change_type'], variant.type], ['==', ['get', 'phase'], variant.phase]];
+      const fillId = `change-${variant.key}-fill`;
+      const lineId = `change-${variant.key}-line`;
+      const pointId = `change-${variant.key}-point`;
+      map.addLayer({
+        id: fillId, type: 'fill', source: _changeSourceId, 'source-layer': 'changes',
+        filter: ['all', ...commonFilter, ['==', ['geometry-type'], 'Polygon']], paint: { 'fill-color': variant.color, 'fill-opacity': variant.phase === 'before' ? 0.16 : 0.3 },
+      }, before);
+      map.addLayer({
+        id: lineId, type: 'line', source: _changeSourceId, 'source-layer': 'changes',
+        filter: ['all', ...commonFilter, ['!=', ['geometry-type'], 'Point']], paint: {
+          'line-color': variant.color, 'line-width': 3,
+          'line-opacity': variant.phase === 'before' ? 0.75 : 1,
+          ...(variant.dash ? { 'line-dasharray': variant.dash } : {}),
+        },
+      }, before);
+      map.addLayer({
+        id: pointId, type: 'circle', source: _changeSourceId, 'source-layer': 'changes',
+        filter: ['all', ...commonFilter, ['==', ['geometry-type'], 'Point']], paint: {
+          'circle-color': variant.color, 'circle-radius': 7,
+          'circle-stroke-color': '#111418', 'circle-stroke-width': 2,
+        },
+      }, before);
+      _changeLayerIds.push(fillId, lineId, pointId);
+    }
+    raiseMarkerLayers();
+  }
+
+  function comparisonControl() {
+    let control = document.getElementById('map-change-comparison');
+    if (control) return control;
+    control = document.createElement('div');
+    control.id = 'map-change-comparison';
+    control.hidden = true;
+    control.innerHTML = `<div class="map-change-comparison-meta"></div>
+      <div class="map-change-comparison-legend"><span class="added">Added</span><span class="removed">Removed</span><span class="style">Style only</span></div>
+      <div class="map-change-comparison-modes" role="group" aria-label="Map change comparison">
+        <button type="button" data-change-mode="before">Before</button>
+        <button type="button" data-change-mode="changes">Changes</button>
+        <button type="button" data-change-mode="after">After</button>
+      </div>
+      <button class="map-change-comparison-close" type="button" aria-label="Close map comparison">×</button>`;
+    document.getElementById('app').appendChild(control);
+    control.querySelectorAll('[data-change-mode]').forEach(button => {
+      button.addEventListener('click', () => renderChangeComparison(button.dataset.changeMode));
+    });
+    control.querySelector('.map-change-comparison-close').addEventListener('click', exitChangeComparison);
+    return control;
+  }
+
+  function comparisonPayload(detail, snapshot) {
+    return {
+      ...snapshot,
+      id: detail.source.id,
+      mapper_id: detail.source.id,
+      kind: detail.source.kind,
+      display_name: detail.source.display_name,
+      available: true,
+      snapshot_id: snapshot.id,
+      last_updated: Date.parse(detail.observed_at) / 1000,
+      status: 'ok',
+    };
+  }
+
+  function renderChangeComparison(mode = 'changes') {
+    if (!_changeComparison) return;
+    const detail = _changeComparison.detail;
+    _changeComparison.mode = mode;
+    const snapshot = mode === 'before' ? detail.before : detail.after;
+    if (!snapshot) return;
+    const payload = comparisonPayload(detail, snapshot);
+    if (detail.source.kind === 'fortifications') {
+      _fortData = payload;
+      addFortLayers(payload);
+    } else {
+      _activeMapperId = detail.source.id;
+      _overlayData = payload;
+      buildMapperSwitcher();
+      addOverlayLayers(payload);
+      renderMapperMeta(payload);
+    }
+    if (mode === 'changes') addChangeLayers(detail);
+    else removeChangeLayers();
+    const control = comparisonControl();
+    control.hidden = false;
+    control.querySelector('.map-change-comparison-meta').textContent = `${detail.source.display_name} · ${formatComparisonTime(detail.observed_at)} Kyiv`;
+    control.querySelectorAll('[data-change-mode]').forEach(button => {
+      button.classList.toggle('active', button.dataset.changeMode === mode);
+    });
+    renderLegend();
+  }
+
+  function formatComparisonTime(raw) {
+    return new Intl.DateTimeFormat('en-GB', {
+      day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+      timeZone: 'Europe/Kyiv', hour12: false,
+    }).format(new Date(raw));
+  }
+
+  function showChangeComparison(detail) {
+    if (!detail?.before || !detail?.after) return;
+    if (_changeComparison) exitChangeComparison();
+    _changeComparison = { detail, mode: 'changes', returnMapperId: _activeMapperId };
+    renderChangeComparison('changes');
+    const [west, south, east, north] = detail.bounds;
+    const lonPad = Math.max((east - west) * 0.16, 0.05);
+    const latPad = Math.max((north - south) * 0.16, 0.04);
+    map.fitBounds([[west - lonPad, south - latPad], [east + lonPad, north + latPad]], {
+      padding: { top: 80, right: 40, bottom: 100, left: 40 },
+      maxZoom: 12, duration: 900, essential: true,
+    });
+  }
+
+  function exitChangeComparison() {
+    if (!_changeComparison) return;
+    const returnMapperId = _changeComparison.returnMapperId;
+    _changeComparison = null;
+    removeChangeLayers();
+    const control = document.getElementById('map-change-comparison');
+    if (control) control.hidden = true;
+    if (_mapState) {
+      _activeMapperId = returnMapperId;
+      applyTemporalMapState(_mapState, { forceGeometry: true });
     }
   }
 
@@ -734,6 +904,17 @@
     renderLegend();
   }
 
+  function updateMapChangesContext(state = _mapState) {
+    if (!window.MarketDrawer?.setMapChangesContext) return;
+    const sources = [...(state?.mappers || [])];
+    if (state?.fortifications) sources.push(state.fortifications);
+    window.MarketDrawer.setMapChangesContext({
+      enabled: Boolean(state?.map_changes_enabled),
+      date: state?.date || _geoDate,
+      sources,
+    });
+  }
+
   function applyTemporalMapState(state, { forceGeometry = false } = {}) {
     if (!state?.vector_tiles_enabled) return false;
     const previousOverlayKey = `${_overlayData?.mapper_id || ''}:${_overlayData?.snapshot_id || ''}`;
@@ -752,6 +933,7 @@
     const nextFortKey = `${nextFort?.id || ''}:${nextFort?.snapshot_id || ''}`;
     _overlayData = nextOverlay;
     _fortData = nextFort;
+    updateMapChangesContext(state);
     buildMapperSwitcher();
     renderMapperMeta(nextOverlay);
     if (map.isStyleLoaded()) {
@@ -767,6 +949,7 @@
   }
 
   async function selectGeoDate(date) {
+    if (_changeComparison) exitChangeComparison();
     if (!date || date === _geoDate || !_geoDates.includes(date)) return;
     const requestSerial = ++_geoRequestSerial;
     let failed = false;
@@ -1355,7 +1538,9 @@
         onLocate: locateMarketCity,
         onResize: () => map.resize(),
         onGeoLocate: locateGeoEvent,
+        onMapChangeLocate: showChangeComparison,
       });
+      updateMapChangesContext();
       startupMarketPromise.then(data => window.MarketDrawer.setMarketData(data));
       renderLegend();
     });
@@ -1377,6 +1562,7 @@
         _geoDate = state.date;
       }
       _mappers = index.mappers;
+      updateMapChangesContext(state);
       _activeMapperId = selected.id;
       buildMapperSwitcher();
       if (!overlay || overlay.error) {
@@ -1447,6 +1633,7 @@
 
   setInterval(async () => {
     if (!_activeMapperId || !map.isStyleLoaded()) return;
+    if (_changeComparison) return;
     if (_temporalMode) {
       const selectedBefore = _geoDate;
       const wasLatest = selectedBefore && selectedBefore === _geoDates.at(-1);

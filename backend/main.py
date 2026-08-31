@@ -36,6 +36,7 @@ mapper_service = MapperService()
 POSTGIS_CONFIGURED = postgis_enabled()
 POSTGIS_READS_ENABLED = POSTGIS_CONFIGURED and os.getenv("WARDOTFUN_POSTGIS_READS_ENABLED", "0") == "1"
 VECTOR_TILES_ENABLED = POSTGIS_CONFIGURED and os.getenv("WARDOTFUN_VECTOR_TILES_ENABLED", "0") == "1"
+MAP_CHANGES_ENABLED = VECTOR_TILES_ENABLED and os.getenv("WARDOTFUN_MAP_CHANGES_ENABLED", "0") == "1"
 temporal_repository = TemporalMapRepository() if POSTGIS_CONFIGURED else None
 geo_service = GeolocationsService(
     read_only=POSTGIS_READS_ENABLED,
@@ -173,6 +174,7 @@ def health():
         "status": "ok",
         "storage": storage,
         "vector_tiles_enabled": VECTOR_TILES_ENABLED,
+        "map_changes_enabled": MAP_CHANGES_ENABLED,
     }
     if temporal_repository:
         try:
@@ -228,6 +230,7 @@ def map_state(request: Request, date: str | None = None):
         except Exception as exc:
             logger.exception("Map-state query failed")
             raise HTTPException(status_code=503, detail="temporal map storage is unavailable") from exc
+    state["map_changes_enabled"] = MAP_CHANGES_ENABLED
     # The manifest is intentionally tiny. Re-encode it so freshness/error changes
     # receive a new ETag even when all immutable snapshot IDs stay the same.
     return _conditional_json(request, state)
@@ -265,6 +268,104 @@ def map_tile(
         media_type="application/vnd.mapbox-vector-tile",
         headers=headers,
     )
+
+
+def _require_map_changes():
+    if not MAP_CHANGES_ENABLED or not temporal_repository:
+        raise HTTPException(status_code=404, detail="map changes are not enabled")
+
+
+@app.get("/api/map-changes")
+def map_changes(
+    request: Request,
+    date: str | None = None,
+    source: str | None = None,
+    cursor: str | None = None,
+    limit: int = 20,
+):
+    _require_map_changes()
+    try:
+        payload = temporal_repository.get_map_changes(
+            selected=date, source_id=source, cursor=cursor, limit=limit
+        )
+    except TemporalDataError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Map-change feed query failed")
+        raise HTTPException(status_code=503, detail="map-change storage is unavailable") from exc
+    return _conditional_json(request, payload)
+
+
+@app.get("/api/map-changes/status")
+def map_change_status(request: Request, date: str | None = None, after: str | None = None):
+    _require_map_changes()
+    try:
+        payload = temporal_repository.get_map_change_status(selected=date, after=after)
+    except TemporalDataError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Map-change status query failed")
+        raise HTTPException(status_code=503, detail="map-change storage is unavailable") from exc
+    return _conditional_json(request, payload)
+
+
+@app.get("/api/map-changes/{area_id}")
+def map_change(request: Request, area_id: str):
+    _require_map_changes()
+    try:
+        payload = temporal_repository.get_map_change(area_id)
+    except TemporalDataError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="map change not found") from exc
+    except Exception as exc:
+        logger.exception("Map-change detail query failed")
+        raise HTTPException(status_code=503, detail="map-change storage is unavailable") from exc
+    return _conditional_json(request, payload, cache_control="public, max-age=31536000, immutable")
+
+
+@app.get("/api/map-change-images/v2/{area_id}.svg")
+def map_change_image(request: Request, area_id: str):
+    _require_map_changes()
+    try:
+        svg, etag = temporal_repository.get_change_svg(area_id)
+    except TemporalDataError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="map change not found") from exc
+    except Exception as exc:
+        logger.exception("Map-change SVG render failed")
+        raise HTTPException(status_code=503, detail="map-change image is unavailable") from exc
+    headers = {
+        "ETag": etag,
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if request.headers.get("if-none-match") in {etag, "*"}:
+        return Response(status_code=304, headers=headers)
+    return Response(content=svg, media_type="image/svg+xml", headers=headers)
+
+
+@app.get("/api/map-change-tiles/v2/{area_id}/{z}/{x}/{y}.pbf")
+def map_change_tile(request: Request, area_id: str, z: int, x: int, y: int):
+    _require_map_changes()
+    try:
+        tile, etag = temporal_repository.get_change_tile(area_id, z, x, y)
+    except TemporalDataError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="map change not found") from exc
+    except Exception as exc:
+        logger.exception("Map-change tile query failed")
+        raise HTTPException(status_code=503, detail="map-change tile is unavailable") from exc
+    headers = {
+        "ETag": etag, "Cache-Control": "public, max-age=31536000, immutable",
+        "Vary": "Accept-Encoding",
+    }
+    if request.headers.get("if-none-match") in {etag, "*"}:
+        return Response(status_code=304, headers=headers)
+    return Response(content=tile, media_type="application/vnd.mapbox-vector-tile", headers=headers)
 
 
 @app.get("/api/geolocations")

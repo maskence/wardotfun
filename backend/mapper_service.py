@@ -408,6 +408,7 @@ class GoogleMyMapsMapperSource(BaseMapperSource):
     def refresh_if_due(self):
         if self._last_fetched and (time.time() - self._last_fetched) < self.refresh_interval:
             return
+        attempted_at = time.time()
         try:
             lm_sent = self._kml_last_modified
             xml_bytes, last_modified = _request_bytes(self._kml_url, lm_sent)
@@ -431,8 +432,13 @@ class GoogleMyMapsMapperSource(BaseMapperSource):
             logger.info("%s mapper refreshed (%d layers)", self.id, len(payload["layers"]))
         except Exception as exc:
             with self._lock:
+                # Back off after a failed fetch/parse just as we do after a
+                # successful attempt. Without this, the worker retries this
+                # source on every poll and archives the same unusable response.
+                self._last_fetched = attempted_at
                 self._last_error = str(exc)
             logger.warning("Failed to refresh %s mapper: %s", self.id, exc)
+            self._save_cache()
 
     def is_due(self) -> bool:
         return not self._last_fetched or (time.time() - self._last_fetched) >= self.refresh_interval
@@ -694,11 +700,8 @@ class MapperService:
                 attribution="UA Control Map / Google My Maps",
                 kml_mid="1xPxgT8LtUjuspSOGHJc2VzA5O5jWMTE",
                 included_folders=[
-                    "Ukrainian advances",
-                    "Confirmed Russian advances",
-                    "Confirmed Control",
-                    "Defense lines and forts",
-                    "Ukrainian advance",
+                    "Frontline",
+                    "Important Areas",
                 ],
             ),
             "kalibrated": GoogleMyMapsMapperSource(

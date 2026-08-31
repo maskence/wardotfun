@@ -20,6 +20,19 @@ window.MarketDrawer = (() => {
   let _geoDetail = new Map();
   let _focusedCity = null;
   let _showNoResolutions = false;
+  let _onMapChangeLocate = null;
+  let _changesEnabled = false;
+  let _changeDate = null;
+  let _changeSources = [];
+  let _changeSource = '';
+  let _changeItems = [];
+  let _changeNextCursor = null;
+  let _changeLoading = false;
+  let _changeError = false;
+  let _changeRequestSerial = 0;
+  let _changeLatestCursor = null;
+  let _changeUnread = 0;
+  const CHANGE_SEEN_KEY = 'wardotfun:map-changes:v2:last-seen';
 
   function init(cityMap, options = {}) {
     const drawer = document.getElementById('market-drawer');
@@ -29,6 +42,7 @@ window.MarketDrawer = (() => {
     _onLocate = options.onLocate || null;
     _onResize = options.onResize || null;
     _onGeoLocate = options.onGeoLocate || null;
+    _onMapChangeLocate = options.onMapChangeLocate || null;
     _cityEntries = new Map();
     _cities = buildCities(cityMap);
 
@@ -59,6 +73,11 @@ window.MarketDrawer = (() => {
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s6-5.2 6-12a6 6 0 1 0-12 0c0 6.8 6 12 6 12Z"></path><circle cx="12" cy="9" r="2"></circle></svg>
             <span>Geolocations</span>
           </button>
+          <button class="market-drawer-tool" type="button" role="tab" aria-selected="false" hidden
+                  data-drawer-tool="changes" aria-label="Map changes" title="Map changes">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h11M4 12h16M4 17h9"></path><path d="m16 5 3 2-3 2M15 15l3 2-3 2"></path></svg>
+            <span>Changes</span><b class="map-change-unread" hidden></b>
+          </button>
         </div>
         <label class="market-drawer-search">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg>
@@ -76,6 +95,10 @@ window.MarketDrawer = (() => {
         _activeTool = button.dataset.drawerTool;
         input.value = '';
         renderList(drawer, '');
+        if (_activeTool === 'changes') {
+          loadChanges(true);
+          markChangesSeen();
+        }
       });
     });
     toggle.addEventListener('click', () => {
@@ -88,6 +111,7 @@ window.MarketDrawer = (() => {
       }
     });
     renderList(drawer, '');
+    setInterval(refreshChangeStatus, 60_000);
   }
 
   function buildCities(cityMap) {
@@ -127,6 +151,92 @@ window.MarketDrawer = (() => {
     return cities.sort((a, b) => a.name.localeCompare(b.name));
   }
 
+  function seenChangeState() {
+    try {
+      const raw = localStorage.getItem(CHANGE_SEEN_KEY);
+      if (!raw) return null;
+      try { return JSON.parse(raw); } catch (_error) { return { cursor: raw, date: null }; }
+    } catch (_error) { return null; }
+  }
+
+  function storeSeenChangeCursor(cursor, date) {
+    if (!cursor) return;
+    const current = seenChangeState();
+    if (current?.date && date && current.date > date) return;
+    try { localStorage.setItem(CHANGE_SEEN_KEY, JSON.stringify({ cursor, date })); } catch (_error) {}
+  }
+
+  function updateChangeBadge() {
+    const badge = _drawer?.querySelector('.map-change-unread');
+    if (!badge) return;
+    badge.hidden = !_changeUnread;
+    badge.textContent = _changeUnread > 99 ? '99+' : String(_changeUnread || '');
+  }
+
+  async function refreshChangeStatus() {
+    if (!_changesEnabled || !_changeDate || !_drawer) return;
+    const seen = seenChangeState();
+    const status = await API.fetchMapChangeStatus(_changeDate, seen?.cursor || null);
+    if (!status) return;
+    _changeLatestCursor = status.latest_cursor;
+    if (!seen && _changeLatestCursor) storeSeenChangeCursor(_changeLatestCursor, _changeDate);
+    _changeUnread = seen ? status.unread_count || 0 : 0;
+    updateChangeBadge();
+  }
+
+  function markChangesSeen() {
+    if (_changeLatestCursor) storeSeenChangeCursor(_changeLatestCursor, _changeDate);
+    _changeUnread = 0;
+    updateChangeBadge();
+  }
+
+  async function loadChanges(reset = false) {
+    if (!_changesEnabled || _changeLoading) return;
+    const requestSerial = ++_changeRequestSerial;
+    _changeLoading = true;
+    _changeError = false;
+    if (reset) {
+      _changeItems = [];
+      _changeNextCursor = null;
+    }
+    if (_drawer && _activeTool === 'changes') renderChangeList(_drawer);
+    const payload = await API.fetchMapChanges({
+      date: _changeDate,
+      source: _changeSource || null,
+      cursor: reset ? null : _changeNextCursor,
+    });
+    if (requestSerial !== _changeRequestSerial) return;
+    _changeLoading = false;
+    if (!payload || !Array.isArray(payload.items)) {
+      _changeError = true;
+    } else {
+      _changeItems = reset ? payload.items : [..._changeItems, ...payload.items];
+      _changeNextCursor = payload.next_cursor || null;
+      if (_changeItems[0]?.cursor) _changeLatestCursor = _changeItems[0].cursor;
+    }
+    if (_drawer && _activeTool === 'changes') renderChangeList(_drawer);
+  }
+
+  function setMapChangesContext({ enabled = false, date = null, sources = [] } = {}) {
+    const contextChanged = date !== _changeDate;
+    _changesEnabled = Boolean(enabled);
+    _changeDate = date;
+    _changeSources = sources;
+    if (!_changeSources.some(source => source.id === _changeSource)) _changeSource = '';
+    const button = _drawer?.querySelector('[data-drawer-tool="changes"]');
+    if (button) button.hidden = !_changesEnabled;
+    if (!_changesEnabled && _activeTool === 'changes') _activeTool = 'markets';
+    if (contextChanged) {
+      _changeRequestSerial += 1;
+      _changeLoading = false;
+      _changeItems = [];
+      _changeNextCursor = null;
+      if (_activeTool === 'changes') loadChanges(true);
+    }
+    refreshChangeStatus();
+    if (_drawer) renderList(_drawer, _drawer.querySelector('input[type="search"]').value);
+  }
+
   function isActiveMarket(market) {
     return market.status ? market.status === 'active' : market.active !== false;
   }
@@ -155,11 +265,13 @@ window.MarketDrawer = (() => {
   function renderList(drawer, rawQuery) {
     const recent = _activeTool === 'recent';
     const geolocations = _activeTool === 'geolocations';
-    drawer.querySelector('.market-drawer-title').textContent = geolocations ? 'Geolocations' : recent ? 'Recent resolutions' : 'Market cities';
-    drawer.querySelector('.market-drawer-count').textContent = geolocations ? (_geoData.events || []).length : recent ? _resolvedMarkets.filter(market => _showNoResolutions || normalize(market.outcome) !== 'no').length : _cities.length;
+    const changes = _activeTool === 'changes';
+    drawer.querySelector('.market-drawer-title').textContent = changes ? 'Map changes' : geolocations ? 'Geolocations' : recent ? 'Recent resolutions' : 'Market cities';
+    drawer.querySelector('.market-drawer-count').textContent = changes ? _changeItems.length : geolocations ? (_geoData.events || []).length : recent ? _resolvedMarkets.filter(market => _showNoResolutions || normalize(market.outcome) !== 'no').length : _cities.length;
     drawer.querySelector('.market-drawer-results-meta').classList.toggle('with-resolution-toggle', recent);
+    drawer.querySelector('.market-drawer-results-meta').classList.toggle('with-change-filter', changes);
     const input = drawer.querySelector('input[type="search"]');
-    drawer.querySelector('.market-drawer-search').hidden = geolocations;
+    drawer.querySelector('.market-drawer-search').hidden = geolocations || changes;
     input.placeholder = recent ? 'Search recent resolutions' : 'Search cities or markets';
     input.setAttribute('aria-label', input.placeholder);
     drawer.querySelectorAll('[data-drawer-tool]').forEach(button => {
@@ -167,13 +279,81 @@ window.MarketDrawer = (() => {
       button.classList.toggle('active', active);
       button.setAttribute('aria-selected', String(active));
     });
-    if (geolocations) {
+    if (changes) {
+      renderChangeList(drawer);
+    } else if (geolocations) {
       renderGeoList(drawer, rawQuery);
     } else if (recent) {
       renderResolvedList(drawer, rawQuery);
     } else {
       renderActiveList(drawer, rawQuery);
     }
+  }
+
+  function formatChangeTime(raw) {
+    const timestamp = Date.parse(raw || '');
+    if (Number.isNaN(timestamp)) return 'Unknown time';
+    return new Intl.DateTimeFormat('en-GB', {
+      day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+      timeZone: 'Europe/Kyiv', hour12: false,
+    }).format(new Date(timestamp));
+  }
+
+  async function openMapChange(areaId) {
+    const detail = await API.fetchMapChange(areaId);
+    if (detail && _onMapChangeLocate) _onMapChangeLocate(detail);
+  }
+
+  function changeCountsHTML(counts = {}) {
+    return [
+      ['added', counts.added, '+'], ['removed', counts.removed, '−'],
+      ['modified', counts.modified, '±'], ['style', counts.style, 'Style'],
+    ].filter(([_kind, count]) => count).map(([kind, count, label]) =>
+      `<span class="map-change-count ${kind}">${label} ${count}</span>`
+    ).join('');
+  }
+
+  function renderChangeList(drawer) {
+    const meta = drawer.querySelector('.market-drawer-results-meta');
+    meta.innerHTML = `<span>${_changeItems.length}${_changeNextCursor ? '+' : ''} affected areas</span>
+      <select class="map-change-source" aria-label="Filter map changes by source">
+        <option value="">All sources</option>
+        ${_changeSources.map(source => `<option value="${escHtml(source.id)}" ${source.id === _changeSource ? 'selected' : ''}>${escHtml(source.display_name)}</option>`).join('')}
+      </select>`;
+    meta.querySelector('.map-change-source')?.addEventListener('change', event => {
+      _changeSource = event.target.value;
+      _changeRequestSerial += 1;
+      _changeLoading = false;
+      loadChanges(true);
+    });
+    const list = drawer.querySelector('.market-drawer-list');
+    if (_changeLoading && !_changeItems.length) {
+      list.innerHTML = '<div class="market-drawer-empty">Loading map changes…</div>';
+      return;
+    }
+    if (_changeError && !_changeItems.length) {
+      list.innerHTML = '<div class="market-drawer-empty">Map changes are unavailable.<button class="map-change-retry" type="button">Retry</button></div>';
+      list.querySelector('.map-change-retry')?.addEventListener('click', () => loadChanges(true));
+      return;
+    }
+    if (!_changeItems.length) {
+      list.innerHTML = '<div class="market-drawer-empty">No visible map changes through this date.</div>';
+      return;
+    }
+    list.innerHTML = `${_changeItems.map(item => `
+      <article class="map-change-card">
+        <button class="map-change-open" type="button" data-map-change="${escHtml(item.id)}" aria-label="Compare ${escHtml(item.source.display_name)} map change">
+          <img class="map-change-image" src="${escHtml(item.thumbnail_url)}" alt="Added, removed, and modified map geometry" loading="lazy">
+          <span class="map-change-card-head"><strong>${escHtml(item.source.display_name)}</strong><time>${escHtml(formatChangeTime(item.observed_at))} Kyiv</time></span>
+          <span class="map-change-counts">${changeCountsHTML(item.counts)}</span>
+          <span class="map-change-action">Compare on map →</span>
+        </button>
+      </article>`).join('')}
+      ${_changeNextCursor ? `<button class="map-change-more" type="button" ${_changeLoading ? 'disabled' : ''}>${_changeLoading ? 'Loading…' : 'Load more'}</button>` : ''}`;
+    list.querySelectorAll('[data-map-change]').forEach(button => {
+      button.addEventListener('click', () => openMapChange(button.dataset.mapChange));
+    });
+    list.querySelector('.map-change-more')?.addEventListener('click', () => loadChanges(false));
   }
 
   function renderActiveList(drawer, rawQuery) {
@@ -808,5 +988,8 @@ window.MarketDrawer = (() => {
     });
   }
 
-  return { init, setMarketData, setGeolocations, openGeolocation, openCity };
+  return {
+    init, setMarketData, setGeolocations, setMapChangesContext,
+    openGeolocation, openCity,
+  };
 })();

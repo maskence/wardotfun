@@ -140,6 +140,7 @@ class IngestionWorker:
     def setup(self, *, migrate: bool = True) -> None:
         if migrate:
             self.repository.database.migrate()
+        self.repository.backfill_change_observations()
         if self.geolocation_source is None:
             self.geolocation_source = PostGISGeoConfirmedGeolocationsSource(
                 database=self.repository.database, read_only=False
@@ -216,6 +217,11 @@ class IngestionWorker:
         with capture_raw_responses(capture):
             source.refresh_if_due()
         payload = source.get_overlay()
+        if payload.get("status") in {"stale", "error"}:
+            error = source._last_error or "upstream refresh failed; retained stale layers"
+            self.repository.record_failure(source.id, error, raw_records=raw_records)
+            log.warning("Ingest failed for %s: %s", source.id, error)
+            return None
         if payload.get("layers"):
             result = self.repository.ingest_overlay(
                 payload,
@@ -229,11 +235,6 @@ class IngestionWorker:
                 result.snapshot_id,
                 result.feature_count,
             )
-            if payload.get("status") == "stale":
-                self.repository.record_failure(
-                    source.id,
-                    source._last_error or "upstream refresh failed; retained stale layers",
-                )
             return result
         error = source._last_error or "upstream returned no usable layers"
         self.repository.record_failure(source.id, error, raw_records=raw_records)

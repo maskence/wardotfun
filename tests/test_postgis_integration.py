@@ -8,6 +8,7 @@ import sys
 import unittest
 import uuid
 import json
+import math
 import tempfile
 import time
 from datetime import date, datetime, timezone
@@ -114,6 +115,113 @@ class PostGISIntegrationTests(unittest.TestCase):
         old_source = next(item for item in old_state["mappers"] if item["id"] == source_id)
         self.assertFalse(old_source["available"])
         self.assertEqual(old_source["status"], "unavailable")
+
+    def test_change_feed_records_reversions_and_splits_distant_areas(self):
+        source_id = f"test-{uuid.uuid4().hex[:12]}"
+        self.repository.register_source(
+            source_id=source_id, kind="mapper", display_name="Change Test",
+            source_url=None, attribution="test", upstream_type="test",
+        )
+
+        def payload(kyiv_lon, donetsk_lon):
+            return {
+                "mapper_id": source_id,
+                "layers": [{
+                    "id": "points", "label": "Points", "geom_type": "point",
+                    "paint": {"circle_color": "#fff"},
+                    "data": {"type": "FeatureCollection", "features": [
+                        {"type": "Feature", "id": "kyiv", "geometry": {"type": "Point", "coordinates": [kyiv_lon, 50.45]}, "properties": {"name": "Kyiv"}},
+                        {"type": "Feature", "id": "donetsk", "geometry": {"type": "Point", "coordinates": [donetsk_lon, 48.0]}, "properties": {"name": "Donetsk"}},
+                    ]},
+                }],
+            }
+
+        first = self.repository.ingest_overlay(
+            payload(30.52, 37.80), captured_at=datetime(2026, 8, 29, 8, tzinfo=timezone.utc)
+        )
+        second = self.repository.ingest_overlay(
+            payload(30.62, 37.90), captured_at=datetime(2026, 8, 29, 9, tzinfo=timezone.utc)
+        )
+        reverted = self.repository.ingest_overlay(
+            payload(30.52, 37.80), captured_at=datetime(2026, 8, 29, 10, tzinfo=timezone.utc)
+        )
+        self.assertEqual(reverted.snapshot_id, first.snapshot_id)
+        self.assertNotEqual(reverted.observation_id, first.observation_id)
+        self.assertNotEqual(second.snapshot_id, first.snapshot_id)
+
+        with self.database.connect(dict_rows=True) as conn:
+            observations = conn.execute(
+                "SELECT count(*) AS count FROM map_snapshot_observations WHERE source_id = %s",
+                (source_id,),
+            ).fetchone()["count"]
+        self.assertEqual(observations, 3)
+
+        feed = self.repository.get_map_changes(selected="20260829", source_id=source_id)
+        self.assertEqual(len(feed["items"]), 4)
+        page_one = self.repository.get_map_changes(
+            selected="20260829", source_id=source_id, limit=1
+        )
+        page_two = self.repository.get_map_changes(
+            selected="20260829", source_id=source_id,
+            cursor=page_one["next_cursor"], limit=1,
+        )
+        self.assertNotEqual(page_one["items"][0]["id"], page_two["items"][0]["id"])
+        status = self.repository.get_map_change_status(
+            selected="20260829", after=feed["items"][-1]["cursor"]
+        )
+        self.assertGreaterEqual(status["unread_count"], 3)
+        state = self.repository.get_map_state("20260829")
+        state_source = next(item for item in state["mappers"] if item["id"] == source_id)
+        self.assertEqual(state_source["snapshot_id"], first.snapshot_id)
+        latest = feed["items"][0]
+        self.assertEqual(latest["counts"]["modified"], 1)
+        detail = self.repository.get_map_change(latest["id"])
+        self.assertEqual(detail["after"]["id"], first.snapshot_id)
+        self.assertEqual(detail["before"]["id"], second.snapshot_id)
+        svg, svg_etag = self.repository.get_change_svg(latest["id"])
+        self.assertTrue(svg.startswith(b'<svg xmlns="http://www.w3.org/2000/svg"'))
+        self.assertIn(b"#54e383", svg)
+        self.assertIn(b"#e34b4b", svg)
+        self.assertTrue(svg_etag.startswith('"'))
+        west, south, east, north = latest["bounds"]
+        lon, lat = (west + east) / 2, (south + north) / 2
+        tile_x = int((lon + 180) / 360 * (1 << 6))
+        tile_y = int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * (1 << 6))
+        tile, tile_etag = self.repository.get_change_tile(latest["id"], 6, tile_x, tile_y)
+        self.assertTrue(tile)
+        self.assertNotEqual(svg_etag, tile_etag)
+
+    def test_change_feed_ignores_internal_metadata_but_records_style(self):
+        source_id = f"test-{uuid.uuid4().hex[:12]}"
+        self.repository.register_source(
+            source_id=source_id, kind="mapper", display_name="Style Test",
+            source_url=None, attribution="test", upstream_type="test",
+        )
+
+        def payload(updated, color="#fff"):
+            return {
+                "mapper_id": source_id,
+                "layers": [{
+                    "id": "point", "label": "Point", "geom_type": "point",
+                    "paint": {"circle_color": color},
+                    "data": {"type": "FeatureCollection", "features": [{
+                        "type": "Feature", "id": "one",
+                        "geometry": {"type": "Point", "coordinates": [30.52, 50.45]},
+                        "properties": {"name": "Kyiv", "updated_at": updated},
+                    }]},
+                }],
+            }
+
+        self.repository.ingest_overlay(payload("one"), captured_at=datetime(2026, 8, 28, 8, tzinfo=timezone.utc))
+        metadata = self.repository.ingest_overlay(payload("two"), captured_at=datetime(2026, 8, 28, 9, tzinfo=timezone.utc))
+        style = self.repository.ingest_overlay(payload("two", "#000"), captured_at=datetime(2026, 8, 28, 10, tzinfo=timezone.utc))
+        self.assertNotEqual(metadata.snapshot_id, style.snapshot_id)
+        feed = self.repository.get_map_changes(selected="20260828", source_id=source_id)
+        self.assertEqual(len(feed["items"]), 1)
+        self.assertEqual(feed["items"][0]["counts"]["style"], 1)
+        self.assertEqual(feed["items"][0]["counts"]["modified"], 0)
+        svg, _etag = self.repository.get_change_svg(feed["items"][0]["id"])
+        self.assertIn(b"STYLE CHANGE", svg)
 
     def test_sqlite_geoconfirmed_migration_preserves_uuid_and_detail_fields(self):
         from geolocation_service import GeoConfirmedGeolocationsSource

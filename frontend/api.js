@@ -18,6 +18,22 @@ window.API = (() => {
   return {
     startup,
     fetchMapState: (date = null) => request(`/api/map-state${date ? `?date=${encodeURIComponent(date)}` : ''}`),
+    fetchMapChanges: ({ date = null, source = null, cursor = null, limit = 20 } = {}) => {
+      const params = new URLSearchParams();
+      if (date) params.set('date', date);
+      if (source) params.set('source', source);
+      if (cursor) params.set('cursor', cursor);
+      params.set('limit', limit);
+      return request(`/api/map-changes?${params}`);
+    },
+    fetchMapChangeStatus: (date = null, after = null) => {
+      const params = new URLSearchParams();
+      if (date) params.set('date', date);
+      if (after) params.set('after', after);
+      const query = params.toString();
+      return request(`/api/map-changes/status${query ? `?${query}` : ''}`);
+    },
+    fetchMapChange: areaId => request(`/api/map-changes/${encodeURIComponent(areaId)}`),
     fetchMappers: () => request('/api/mappers'),
     fetchMapperOverlay: (mapperId) => request(`/api/mapper-overlay?mapper=${encodeURIComponent(mapperId)}`),
     fetchFortifications: () => request('/api/fortifications'),

@@ -4,19 +4,22 @@ import sys
 import tempfile
 import unittest
 from datetime import date, datetime, timezone
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from ingestion_worker import RawArchive  # noqa: E402
-from mapper_service import GoogleMyMapsMapperSource  # noqa: E402
+from ingestion_worker import IngestionWorker, RawArchive  # noqa: E402
+from mapper_service import GoogleMyMapsMapperSource, MapperService  # noqa: E402
 from temporal_repository import (  # noqa: E402
     MVT_EXTENT,
     TemporalDataError,
     TemporalMapRepository,
     WEB_MERCATOR_WIDTH,
     content_hash,
+    decode_change_cursor,
+    encode_change_cursor,
     kyiv_calendar_date,
     logical_feature_key,
     normalized_overlay,
@@ -49,6 +52,14 @@ def overlay(features, paint=None):
 
 
 class TemporalNormalizationTests(unittest.TestCase):
+    def test_change_cursor_round_trip_and_validation(self):
+        observed = datetime(2026, 8, 29, 12, 30, tzinfo=timezone.utc)
+        area_id = "11111111-1111-4111-8111-111111111111"
+        cursor = encode_change_cursor(observed, area_id)
+        self.assertEqual(decode_change_cursor(cursor), (observed, area_id))
+        with self.assertRaises(TemporalDataError):
+            decode_change_cursor("not-a-valid-cursor")
+
     def test_compact_date_validation(self):
         self.assertEqual(parse_compact_date("20260828"), date(2026, 8, 28))
         with self.assertRaises(TemporalDataError):
@@ -127,6 +138,133 @@ class TemporalNormalizationTests(unittest.TestCase):
         prepared = layers[0]["features"]
         self.assertEqual(len({item["logical_key"] for item in prepared}), 2)
         self.assertTrue(all(item["confidence"] >= 0.85 for item in prepared))
+
+
+    def test_duplicate_identity_preserves_exact_content_before_spatial_matching(self):
+        first = feature([31, 48], {"name": "Same"})
+        second = feature([38, 49], {"name": "Same"})
+        first_hash = content_hash({"geometry": first["geometry"], "properties": first["properties"]})
+        second_hash = content_hash({"geometry": second["geometry"], "properties": second["properties"]})
+
+        class Repository(TemporalMapRepository):
+            @staticmethod
+            def _previous_candidates(_conn, _source_id, bases):
+                base = bases[0]
+                # Deliberately reversed centers model the historical identity-swap bug.
+                return {base: [
+                    {"key": base + "#old-a", "content_hash": first_hash, "center": (38, 49)},
+                    {"key": base + "#old-b", "content_hash": second_hash, "center": (31, 48)},
+                ]}
+
+        prepared = Repository(FakeDatabase())._prepare_layers(
+            None, "test-map", overlay([second, first])
+        )[0]["features"]
+        keys = {item["content_hash"]: item["logical_key"] for item in prepared}
+        self.assertEqual(keys[first_hash].rsplit("#", 1)[-1], "old-a")
+        self.assertEqual(keys[second_hash].rsplit("#", 1)[-1], "old-b")
+
+    def test_v2_diff_uses_exact_pairs_and_true_geometry_deltas(self):
+        sql = (ROOT / "backend/migrations/003_map_change_detection_v2.sql").read_text()
+        self.assertIn("exact_pairs AS", sql)
+        self.assertIn("ST_SymDifference", sql)
+        self.assertIn("ST_Difference", sql)
+        self.assertNotIn("ST_Envelope(CASE", sql)
+        reconciliation = (ROOT / "backend/migrations/004_map_change_spatial_reconciliation.sql").read_text()
+        self.assertIn("spatial_pairs AS", reconciliation)
+        self.assertIn("JOIN new_remaining n USING(base_key)", reconciliation)
+
+    def test_change_layers_filter_geometry_types(self):
+        javascript = (ROOT / "frontend/map.js").read_text()
+        self.assertIn("['==', ['geometry-type'], 'Point']", javascript)
+        self.assertIn("['==', ['geometry-type'], 'Polygon']", javascript)
+        self.assertIn("phase: 'style'", javascript)
+
+
+
+class MapperIngestionTests(unittest.TestCase):
+    def test_uacontrolmap_excludes_unit_marker_folders(self):
+        source = MapperService()._sources["uacontrolmap"]
+        payload = source._parse_kml(b"""<?xml version='1.0'?>
+        <kml xmlns='http://www.opengis.net/kml/2.2'><Document>
+          <Folder><name>Frontline</name><Placemark><name>Front</name>
+            <LineString><coordinates>31,48 32,49</coordinates></LineString>
+          </Placemark></Folder>
+          <Folder><name>Important Areas</name><Placemark><name>Area</name>
+            <Polygon><outerBoundaryIs><LinearRing><coordinates>
+              31,48 32,48 32,49 31,48
+            </coordinates></LinearRing></outerBoundaryIs></Polygon>
+          </Placemark></Folder>
+          <Folder><name>Ukrainian Unit Positions</name><Placemark><name>Unit</name>
+            <Point><coordinates>31,48</coordinates></Point>
+          </Placemark></Folder>
+          <Folder><name>Russian Unit Positions</name><Placemark><name>Unit</name>
+            <Point><coordinates>32,49</coordinates></Point>
+          </Placemark></Folder>
+        </Document></kml>""")
+        self.assertEqual(
+            [layer["label"] for layer in payload["layers"]],
+            ["Frontline", "Important Areas"],
+        )
+        self.assertEqual(
+            sum(len(layer["data"]["features"]) for layer in payload["layers"]), 2
+        )
+
+    def test_failed_kml_parse_backs_off_and_retains_stale_payload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = GoogleMyMapsMapperSource(
+                mapper_id="test-map", display_name="Test",
+                source_url="https://example.test", attribution="Test", kml_mid="unused",
+            )
+            source._cache_path = Path(temporary) / "cache.pkl"
+            source._payload = {"layers": [{"id": "old"}]}
+            before = datetime.now(timezone.utc).timestamp()
+            with mock.patch("mapper_service._request_bytes", return_value=(b"not xml", None)):
+                source.refresh_if_due()
+            self.assertGreaterEqual(source._last_fetched, before)
+            self.assertFalse(source.is_due())
+            self.assertEqual(source.get_overlay()["status"], "stale")
+            self.assertTrue(source._cache_path.exists())
+
+    def test_worker_records_failure_without_ingesting_stale_overlay(self):
+        class Source:
+            id = "broken"
+            _last_error = "parse failed"
+            def is_due(self): return True
+            def refresh_if_due(self): return None
+            def get_overlay(self):
+                return {"status": "stale", "layers": [{"id": "cached"}]}
+
+        class Repository:
+            def __init__(self):
+                self.failures = []
+                self.ingested = False
+            def record_failure(self, source_id, error, raw_records=None):
+                self.failures.append((source_id, error, raw_records))
+            def ingest_overlay(self, *_args, **_kwargs):
+                self.ingested = True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Repository()
+            worker = IngestionWorker(repository=repository, archive=RawArchive(temporary))
+            self.assertIsNone(worker._run_source(Source()))
+            self.assertFalse(repository.ingested)
+            self.assertEqual(repository.failures, [("broken", "parse failed", [])])
+
+
+class PreviousCandidateTests(unittest.TestCase):
+    def test_dict_rows_use_centroid_values_not_column_names(self):
+        class Result:
+            def fetchall(self):
+                return [{"logical_key": "base#1", "content_hash": "abc", "lon": 31.5, "lat": 48.25}]
+
+        class Connection:
+            def execute(self, _sql, _params):
+                return Result()
+
+        self.assertEqual(
+            TemporalMapRepository._previous_candidates(Connection(), "source", ["base"]),
+            {"base": [{"key": "base#1", "content_hash": "abc", "center": (31.5, 48.25)}]},
+        )
 
 
 class RawArchiveTests(unittest.TestCase):
@@ -261,6 +399,35 @@ class HttpTransferTests(unittest.TestCase):
             )
         finally:
             main.temporal_repository = previous
+
+    def test_change_image_and_tile_routes_are_immutable(self):
+        from starlette.requests import Request
+        import main
+
+        class Repository:
+            @staticmethod
+            def get_change_svg(_area):
+                return b"<svg/>", '"change-image"'
+
+            @staticmethod
+            def get_change_tile(*_args):
+                return b"mvt", '"change-tile"'
+
+        previous_repository = main.temporal_repository
+        previous_enabled = main.MAP_CHANGES_ENABLED
+        main.temporal_repository = Repository()
+        main.MAP_CHANGES_ENABLED = True
+        try:
+            request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+            image = main.map_change_image(request, "11111111-1111-4111-8111-111111111111")
+            tile = main.map_change_tile(request, "11111111-1111-4111-8111-111111111111", 6, 37, 21)
+            self.assertEqual(image.media_type, "image/svg+xml")
+            self.assertEqual(tile.media_type, "application/vnd.mapbox-vector-tile")
+            self.assertIn("immutable", image.headers["cache-control"])
+            self.assertIn("immutable", tile.headers["cache-control"])
+        finally:
+            main.temporal_repository = previous_repository
+            main.MAP_CHANGES_ENABLED = previous_enabled
 
 
 if __name__ == "__main__":
