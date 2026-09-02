@@ -332,6 +332,7 @@ def map_change(request: Request, area_id: str):
 
 
 @app.get("/api/map-change-images/v4/{area_id}.svg")
+@app.get("/api/map-change-images/v5/{area_id}.svg")
 def map_change_image(request: Request, area_id: str):
     _require_map_changes()
     try:
@@ -355,6 +356,7 @@ def map_change_image(request: Request, area_id: str):
 
 
 @app.get("/api/map-change-tiles/v4/{area_id}/{z}/{x}/{y}.pbf")
+@app.get("/api/map-change-tiles/v5/{area_id}/{z}/{x}/{y}.pbf")
 def map_change_tile(request: Request, area_id: str, z: int, x: int, y: int):
     _require_map_changes()
     try:

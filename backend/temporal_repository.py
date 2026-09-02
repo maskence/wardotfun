@@ -627,7 +627,7 @@ class TemporalMapRepository:
         ).fetchall()
         ordinal = 0
         for row in clusters:
-            area_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"wardotfun:change:v2:{observation_id}:{ordinal}"))
+            area_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"wardotfun:change:v3:{observation_id}:{ordinal}"))
             conn.execute(
                 """
                 INSERT INTO map_change_areas(
@@ -665,7 +665,7 @@ class TemporalMapRepository:
                 (observation_id,),
             ).fetchone()
             if row and row["bounds"]:
-                area_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"wardotfun:change:v2:{observation_id}:{ordinal}"))
+                area_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"wardotfun:change:v3:{observation_id}:{ordinal}"))
                 conn.execute(
                     """
                     INSERT INTO map_change_areas(
@@ -1294,7 +1294,7 @@ class TemporalMapRepository:
                 "modified": row["modified_count"], "style": row["style_count"],
             },
             "bounds": [row["west"], row["south"], row["east"], row["north"]],
-            "thumbnail_url": f"/api/map-change-images/v4/{row['area_id']}.svg",
+            "thumbnail_url": f"/api/map-change-images/v5/{row['area_id']}.svg",
             "detail_url": f"/api/map-changes/v2/{row['area_id']}",
             "cursor": encode_change_cursor(row["observed_at"], str(row["area_id"])),
         }
@@ -1478,7 +1478,7 @@ class TemporalMapRepository:
                 style["color"] for style in removed_style_rows
                 if re.fullmatch(r"#[0-9a-fA-F]{3,8}", str(style["color"]))
             ],
-            "change_tile_url": f"/api/map-change-tiles/v4/{area_id}/{{z}}/{{x}}/{{y}}.pbf",
+            "change_tile_url": f"/api/map-change-tiles/v5/{area_id}/{{z}}/{{x}}/{{y}}.pbf",
         })
         return item
 
@@ -1585,7 +1585,7 @@ class TemporalMapRepository:
             '<path d="M0 90H640M0 180H640M0 270H640M160 0V360M320 0V360M480 0V360" stroke="#293038" stroke-width="1"/>'
             f'{layers}</svg>'
         ).encode("utf-8")
-        etag = '"' + hashlib.sha256(b"change-svg-v4:" + svg).hexdigest() + '"'
+        etag = '"' + hashlib.sha256(b"change-svg-v5:" + svg).hexdigest() + '"'
         return svg, etag
 
     def get_change_tile(self, area_id: str, z: int, x: int, y: int) -> tuple[bytes, str]:
@@ -1632,7 +1632,7 @@ class TemporalMapRepository:
             ).fetchone()
         tile = bytes(row[0]) if row and row[0] is not None else b""
         etag = '"' + hashlib.sha256(
-            f"change-mvt-v4:{area_id}:{z}:{x}:{y}".encode("ascii")
+            f"change-mvt-v5:{area_id}:{z}:{x}:{y}".encode("ascii")
         ).hexdigest() + '"'
         return tile, etag
 
