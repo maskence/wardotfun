@@ -655,6 +655,43 @@
     _changeSourceId = null;
   }
 
+  function changeHatchId(color) {
+    return `change-hatch-${String(color).replace(/[^0-9a-f]/gi, '').toLowerCase() || '999999'}`;
+  }
+
+  function addChangeHatch(color) {
+    const id = changeHatchId(color);
+    if (map.hasImage(id)) return id;
+    let hex = String(color || '#999999').replace('#', '');
+    if (hex.length === 3) hex = hex.split('').map(value => value + value).join('');
+    if (!/^[0-9a-f]{6}([0-9a-f]{2})?$/i.test(hex)) hex = '999999';
+    const red = parseInt(hex.slice(0, 2), 16);
+    const green = parseInt(hex.slice(2, 4), 16);
+    const blue = parseInt(hex.slice(4, 6), 16);
+    const size = 12;
+    const data = new Uint8Array(size * size * 4);
+    for (let y = 0; y < size; y += 1) {
+      for (let x = 0; x < size; x += 1) {
+        const offset = (y * size + x) * 4;
+        const stripe = ((x + y) % 8) < 3;
+        data[offset] = red;
+        data[offset + 1] = green;
+        data[offset + 2] = blue;
+        data[offset + 3] = stripe ? 235 : 0;
+      }
+    }
+    map.addImage(id, { width: size, height: size, data }, { pixelRatio: 2 });
+    return id;
+  }
+
+  function removedHatchExpression(detail) {
+    const colors = [...new Set([...(detail?.removed_fill_colors || []), '#999999'])];
+    const pairs = [];
+    for (const color of colors) pairs.push(color, ['image', addChangeHatch(color)]);
+    const fallback = addChangeHatch('#999999');
+    return ['match', ['coalesce', ['get', 'fill_color'], '#999999'], ...pairs, ['image', fallback]];
+  }
+
   function addChangeLayers(detail) {
     removeChangeLayers();
     if (!detail?.change_tile_url) return;
@@ -670,6 +707,7 @@
       { key: 'modified-style', type: 'modified', phase: 'style', indicator: '#f0c75e', dash: [2, 2], restore: false },
     ];
     const before = _beforeCities();
+    const removedPattern = removedHatchExpression(detail);
     for (const variant of variants) {
       const commonFilter = [['==', ['get', 'change_type'], variant.type], ['==', ['get', 'phase'], variant.phase]];
       if (variant.restore) {
@@ -679,8 +717,8 @@
           id: fillId, type: 'fill', source: _changeSourceId, 'source-layer': 'changes',
           filter: ['all', ...commonFilter, ['==', ['geometry-type'], 'Polygon']],
           paint: {
-            'fill-color': ['coalesce', ['get', 'fill_color'], '#999999'],
-            'fill-opacity': 0.16,
+            'fill-pattern': removedPattern,
+            'fill-opacity': 1,
           },
         }, before);
         map.addLayer({

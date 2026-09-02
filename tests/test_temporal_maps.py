@@ -180,6 +180,8 @@ class TemporalNormalizationTests(unittest.TestCase):
         self.assertIn("phase: 'style'", javascript)
         self.assertIn("['get', 'fill_color']", javascript)
         self.assertIn("dash: [0.6, 1.5]", javascript)
+        self.assertIn("'fill-pattern': removedPattern", javascript)
+        self.assertIn("map.addImage(id", javascript)
         styled_sql = (ROOT / "backend/migrations/005_map_change_original_style.sql").read_text()
         self.assertIn("map_change_area_styled_geometries", styled_sql)
 

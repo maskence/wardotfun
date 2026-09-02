@@ -316,6 +316,7 @@ def map_change_status(request: Request, date: str | None = None, after: str | No
 
 
 @app.get("/api/map-changes/{area_id}")
+@app.get("/api/map-changes/v2/{area_id}")
 def map_change(request: Request, area_id: str):
     _require_map_changes()
     try:
@@ -330,7 +331,7 @@ def map_change(request: Request, area_id: str):
     return _conditional_json(request, payload, cache_control="public, max-age=31536000, immutable")
 
 
-@app.get("/api/map-change-images/v3/{area_id}.svg")
+@app.get("/api/map-change-images/v4/{area_id}.svg")
 def map_change_image(request: Request, area_id: str):
     _require_map_changes()
     try:
@@ -353,7 +354,7 @@ def map_change_image(request: Request, area_id: str):
     return Response(content=svg, media_type="image/svg+xml", headers=headers)
 
 
-@app.get("/api/map-change-tiles/v3/{area_id}/{z}/{x}/{y}.pbf")
+@app.get("/api/map-change-tiles/v4/{area_id}/{z}/{x}/{y}.pbf")
 def map_change_tile(request: Request, area_id: str, z: int, x: int, y: int):
     _require_map_changes()
     try:

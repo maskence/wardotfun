@@ -1294,8 +1294,8 @@ class TemporalMapRepository:
                 "modified": row["modified_count"], "style": row["style_count"],
             },
             "bounds": [row["west"], row["south"], row["east"], row["north"]],
-            "thumbnail_url": f"/api/map-change-images/v3/{row['area_id']}.svg",
-            "detail_url": f"/api/map-changes/{row['area_id']}",
+            "thumbnail_url": f"/api/map-change-images/v4/{row['area_id']}.svg",
+            "detail_url": f"/api/map-changes/v2/{row['area_id']}",
             "cursor": encode_change_cursor(row["observed_at"], str(row["area_id"])),
         }
 
@@ -1452,11 +1452,28 @@ class TemporalMapRepository:
                 raise KeyError("map-change area not found")
             before = self._snapshot_descriptor(conn, row["source_id"], row["previous_snapshot_id"])
             after = self._snapshot_descriptor(conn, row["source_id"], row["snapshot_id"])
+            removed_style_rows = conn.execute(
+                """
+                SELECT DISTINCT COALESCE(
+                    NULLIF(properties->>'fill_color', ''),
+                    NULLIF(paint->>'fill_color', ''),
+                    '#999999'
+                ) AS color
+                FROM map_change_area_styled_geometries(%s)
+                WHERE phase = 'before'
+                ORDER BY color
+                """,
+                (area_id,),
+            ).fetchall()
         item = self._change_item(row)
         item.update({
             "before": before,
             "after": after,
-            "change_tile_url": f"/api/map-change-tiles/v3/{area_id}/{{z}}/{{x}}/{{y}}.pbf",
+            "removed_fill_colors": [
+                style["color"] for style in removed_style_rows
+                if re.fullmatch(r"#[0-9a-fA-F]{3,8}", str(style["color"]))
+            ],
+            "change_tile_url": f"/api/map-change-tiles/v4/{area_id}/{{z}}/{{x}}/{{y}}.pbf",
         })
         return item
 
@@ -1527,6 +1544,7 @@ class TemporalMapRepository:
             return value if re.fullmatch(r"#[0-9a-fA-F]{3,8}", value) else default
 
         rendered = []
+        patterns = {}
         for row in rows:
             geometry = _svg_geometry(json.loads(row["geometry"]), project)
             key = (row["change_type"], row["phase"])
@@ -1534,10 +1552,18 @@ class TemporalMapRepository:
                 style = "fill:#68717a;fill-opacity:.06;stroke:#68717a;stroke-opacity:.3;stroke-width:1"
             else:
                 fill = safe_color(styled_value(row, "fill_color", "#999999"), "#999999")
+                if row["phase"] == "before":
+                    pattern_id = "removed-hatch-" + fill.lstrip("#").lower()
+                    patterns[pattern_id] = (
+                        f'<pattern id="{pattern_id}" width="10" height="10" patternUnits="userSpaceOnUse"'
+                        f' patternTransform="rotate(-45)"><path d="M0 0V10" stroke="{fill}"'
+                        ' stroke-width="4"/></pattern>'
+                    )
+                    fill = f"url(#{pattern_id})"
                 indicator = "#54e383" if row["phase"] == "after" else (
                     "#ff6868" if row["phase"] == "before" else "#f0c75e"
                 )
-                opacity = 0.16 if row["phase"] == "before" else 0.3
+                opacity = 1 if row["phase"] == "before" else 0.3
                 dash = "8 5" if row["phase"] == "before" else "2 5"
                 style = (
                     f"fill:{fill};fill-opacity:{opacity};stroke:{indicator};"
@@ -1550,10 +1576,11 @@ class TemporalMapRepository:
         svg = (
             '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360">'
             '<rect width="640" height="360" fill="#111418"/>'
+            f'<defs>{"".join(patterns.values())}</defs>'
             '<path d="M0 90H640M0 180H640M0 270H640M160 0V360M320 0V360M480 0V360" stroke="#293038" stroke-width="1"/>'
             f'{layers}</svg>'
         ).encode("utf-8")
-        etag = '"' + hashlib.sha256(b"change-svg-v3:" + svg).hexdigest() + '"'
+        etag = '"' + hashlib.sha256(b"change-svg-v4:" + svg).hexdigest() + '"'
         return svg, etag
 
     def get_change_tile(self, area_id: str, z: int, x: int, y: int) -> tuple[bytes, str]:
@@ -1600,7 +1627,7 @@ class TemporalMapRepository:
             ).fetchone()
         tile = bytes(row[0]) if row and row[0] is not None else b""
         etag = '"' + hashlib.sha256(
-            f"change-mvt-v3:{area_id}:{z}:{x}:{y}".encode("ascii")
+            f"change-mvt-v4:{area_id}:{z}:{x}:{y}".encode("ascii")
         ).hexdigest() + '"'
         return tile, etag
 

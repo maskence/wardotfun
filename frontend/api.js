@@ -33,7 +33,7 @@ window.API = (() => {
       const query = params.toString();
       return request(`/api/map-changes/status${query ? `?${query}` : ''}`);
     },
-    fetchMapChange: areaId => request(`/api/map-changes/${encodeURIComponent(areaId)}`),
+    fetchMapChange: areaId => request(`/api/map-changes/v2/${encodeURIComponent(areaId)}`),
     fetchMappers: () => request('/api/mappers'),
     fetchMapperOverlay: (mapperId) => request(`/api/mapper-overlay?mapper=${encodeURIComponent(mapperId)}`),
     fetchFortifications: () => request('/api/fortifications'),
