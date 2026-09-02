@@ -34,7 +34,7 @@ and `Cache-Control: public, max-age=31536000, immutable`. A matching
 ## Map-change feed
 
 `GET /api/map-changes?date=YYYYMMDD&source=ID&cursor=CURSOR&limit=20`
-returns newest-first affected-area cards through the end of the selected Kyiv
+returns newest-first affected-area cards observed during the selected Kyiv
 day. Cursors are opaque; limits are 1–50. `GET /api/map-changes/status` accepts
 the same date plus `after=CURSOR` and returns the browser-local unread count.
 

@@ -337,7 +337,7 @@ window.MarketDrawer = (() => {
       return;
     }
     if (!_changeItems.length) {
-      list.innerHTML = '<div class="market-drawer-empty">No visible map changes through this date.</div>';
+      list.innerHTML = '<div class="market-drawer-empty">No visible map changes on this date.</div>';
       return;
     }
     list.innerHTML = `${_changeItems.map(item => `

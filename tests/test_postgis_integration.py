@@ -158,6 +158,10 @@ class PostGISIntegrationTests(unittest.TestCase):
 
         feed = self.repository.get_map_changes(selected="20260829", source_id=source_id)
         self.assertEqual(len(feed["items"]), 4)
+        adjacent_day = self.repository.get_map_changes(selected="20260830", source_id=source_id)
+        self.assertEqual(adjacent_day["items"], [])
+        adjacent_status = self.repository.get_map_change_status(selected="20260830")
+        self.assertIsNone(adjacent_status["latest_cursor"])
         page_one = self.repository.get_map_changes(
             selected="20260829", source_id=source_id, limit=1
         )

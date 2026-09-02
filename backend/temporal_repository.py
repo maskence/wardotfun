@@ -1314,6 +1314,7 @@ class TemporalMapRepository:
         selected_date = parse_compact_date(selected, default=datetime.now(KYIV).date())
         if selected_date > datetime.now(KYIV).date():
             raise TemporalDataError("change-feed date cannot be in the future")
+        start = datetime.combine(selected_date, datetime.min.time(), KYIV)
         cutoff = datetime.combine(selected_date + timedelta(days=1), datetime.min.time(), KYIV)
         decoded = decode_change_cursor(cursor)
         cursor_time, cursor_id = decoded if decoded else (None, None)
@@ -1330,7 +1331,8 @@ class TemporalMapRepository:
                 FROM map_change_areas area
                 JOIN map_snapshot_observations observation ON observation.id = area.observation_id
                 JOIN map_sources source ON source.id = observation.source_id
-                WHERE observation.observed_at < %s
+                WHERE observation.observed_at >= %s
+                  AND observation.observed_at < %s
                   AND source.enabled
                   AND (%s::text IS NULL OR source.id = %s)
                   AND (%s::timestamptz IS NULL OR
@@ -1339,7 +1341,7 @@ class TemporalMapRepository:
                 LIMIT %s
                 """,
                 (
-                    cutoff, source_id, source_id, cursor_time, cursor_time,
+                    start, cutoff, source_id, source_id, cursor_time, cursor_time,
                     cursor_id, limit + 1,
                 ),
             ).fetchall()
@@ -1359,6 +1361,7 @@ class TemporalMapRepository:
         selected_date = parse_compact_date(selected, default=datetime.now(KYIV).date())
         if selected_date > datetime.now(KYIV).date():
             raise TemporalDataError("change-feed date cannot be in the future")
+        start = datetime.combine(selected_date, datetime.min.time(), KYIV)
         cutoff = datetime.combine(selected_date + timedelta(days=1), datetime.min.time(), KYIV)
         decoded = decode_change_cursor(after)
         after_time, after_id = decoded if decoded else (None, None)
@@ -1369,10 +1372,11 @@ class TemporalMapRepository:
                 FROM map_change_areas area
                 JOIN map_snapshot_observations observation ON observation.id = area.observation_id
                 JOIN map_sources source ON source.id = observation.source_id
-                WHERE observation.observed_at < %s AND source.enabled
+                WHERE observation.observed_at >= %s
+                  AND observation.observed_at < %s AND source.enabled
                 ORDER BY observation.observed_at DESC, area.id DESC LIMIT 1
                 """,
-                (cutoff,),
+                (start, cutoff),
             ).fetchone()
             if decoded:
                 unread = conn.execute(
@@ -1381,10 +1385,11 @@ class TemporalMapRepository:
                     FROM map_change_areas area
                     JOIN map_snapshot_observations observation ON observation.id = area.observation_id
                     JOIN map_sources source ON source.id = observation.source_id
-                    WHERE observation.observed_at < %s AND source.enabled
+                    WHERE observation.observed_at >= %s
+                  AND observation.observed_at < %s AND source.enabled
                       AND (observation.observed_at, area.id) > (%s, %s::uuid)
                     """,
-                    (cutoff, after_time, after_id),
+                    (start, cutoff, after_time, after_id),
                 ).fetchone()["count"]
             else:
                 unread = 0
