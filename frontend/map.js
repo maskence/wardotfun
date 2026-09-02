@@ -668,12 +668,12 @@
     const red = parseInt(hex.slice(0, 2), 16);
     const green = parseInt(hex.slice(2, 4), 16);
     const blue = parseInt(hex.slice(4, 6), 16);
-    const size = 12;
+    const size = 32;
     const data = new Uint8Array(size * size * 4);
     for (let y = 0; y < size; y += 1) {
       for (let x = 0; x < size; x += 1) {
         const offset = (y * size + x) * 4;
-        const stripe = ((x + y) % 8) < 3;
+        const stripe = ((x + y) % 16) < 5;
         data[offset] = red;
         data[offset + 1] = green;
         data[offset + 2] = blue;
