@@ -174,3 +174,24 @@ remove `/api/mapper-overlay`, `/api/fortifications`, frontend GeoJSON fallback,
 pickle writes, and tracked `backend/data/mapper_cache/*.pkl`. Preserve the raw
 archive and all PostGIS snapshots indefinitely. Keep a tested database restore
 procedure and continue nightly/offsite backups.
+
+## Persistent local ingestion
+
+The web server and ingestion worker are intentionally separate. For a local
+checkout at `~/code/wardotfun`, install the user unit once:
+
+```bash
+cp deploy/systemd/wardotfun-ingest-local.service ~/.config/systemd/user/wardotfun-ingest.service
+systemctl --user daemon-reload
+systemctl --user enable --now wardotfun-ingest.service
+loginctl enable-linger "$USER"
+```
+
+The unit loads the repository `.env`, starts with the user service manager,
+and restarts after failures. User lingering keeps it running after logout and
+starts it after boot. Inspect it with:
+
+```bash
+systemctl --user status wardotfun-ingest.service
+journalctl --user -u wardotfun-ingest.service -f
+```

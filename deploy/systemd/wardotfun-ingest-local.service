@@ -1,0 +1,16 @@
+[Unit]
+Description=wardotfun local temporal map ingestion worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/wardotfun
+EnvironmentFile=%h/code/wardotfun/.env
+ExecStart=%h/code/wardotfun/env/bin/python -m backend.ingestion_worker
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
