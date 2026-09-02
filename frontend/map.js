@@ -673,7 +673,7 @@
     for (let y = 0; y < size; y += 1) {
       for (let x = 0; x < size; x += 1) {
         const offset = (y * size + x) * 4;
-        const stripe = ((x + y) % 16) < 5;
+        const stripe = ((x + y) % 16) < 3;
         data[offset] = red;
         data[offset + 1] = green;
         data[offset + 2] = blue;
