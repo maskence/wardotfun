@@ -663,38 +663,65 @@
       type: 'vector', tiles: [absoluteTileUrl(detail.change_tile_url)], minzoom: 0, maxzoom: 14,
     });
     const variants = [
-      { key: 'added-after', type: 'added', phase: 'after', color: '#54e383', dash: null },
-      { key: 'removed-before', type: 'removed', phase: 'before', color: '#ff6868', dash: [3, 2] },
-      { key: 'modified-before', type: 'modified', phase: 'before', color: '#e34b4b', dash: [2, 2] },
-      { key: 'modified-after', type: 'modified', phase: 'after', color: '#54e383', dash: null },
-      { key: 'modified-style', type: 'modified', phase: 'style', color: '#f0c75e', dash: null },
+      { key: 'added-after', type: 'added', phase: 'after', indicator: '#54e383', dash: [0.6, 1.5], restore: false },
+      { key: 'removed-before', type: 'removed', phase: 'before', indicator: '#ff6868', dash: [3, 2], restore: true },
+      { key: 'modified-before', type: 'modified', phase: 'before', indicator: '#ff6868', dash: [3, 2], restore: true },
+      { key: 'modified-after', type: 'modified', phase: 'after', indicator: '#54e383', dash: [0.6, 1.5], restore: false },
+      { key: 'modified-style', type: 'modified', phase: 'style', indicator: '#f0c75e', dash: [2, 2], restore: false },
     ];
     const before = _beforeCities();
     for (const variant of variants) {
       const commonFilter = [['==', ['get', 'change_type'], variant.type], ['==', ['get', 'phase'], variant.phase]];
-      const fillId = `change-${variant.key}-fill`;
-      const lineId = `change-${variant.key}-line`;
+      if (variant.restore) {
+        const fillId = `change-${variant.key}-original-fill`;
+        const lineId = `change-${variant.key}-original-line`;
+        map.addLayer({
+          id: fillId, type: 'fill', source: _changeSourceId, 'source-layer': 'changes',
+          filter: ['all', ...commonFilter, ['==', ['geometry-type'], 'Polygon']],
+          paint: {
+            'fill-color': ['coalesce', ['get', 'fill_color'], '#999999'],
+            'fill-opacity': 0.16,
+          },
+        }, before);
+        map.addLayer({
+          id: lineId, type: 'line', source: _changeSourceId, 'source-layer': 'changes',
+          filter: ['all', ...commonFilter, ['!=', ['geometry-type'], 'Point']],
+          paint: {
+            'line-color': ['coalesce', ['get', 'line_color'], '#999999'],
+            'line-opacity': 0.35,
+            'line-width': ['+', ['coalesce', ['get', 'line_width'], 1.5], 1],
+          },
+        }, before);
+        _changeLayerIds.push(fillId, lineId);
+      }
+
+      const outlineId = `change-${variant.key}-outline`;
       const pointId = `change-${variant.key}-point`;
       map.addLayer({
-        id: fillId, type: 'fill', source: _changeSourceId, 'source-layer': 'changes',
-        filter: ['all', ...commonFilter, ['==', ['geometry-type'], 'Polygon']], paint: { 'fill-color': variant.color, 'fill-opacity': variant.phase === 'before' ? 0.16 : 0.3 },
-      }, before);
-      map.addLayer({
-        id: lineId, type: 'line', source: _changeSourceId, 'source-layer': 'changes',
-        filter: ['all', ...commonFilter, ['!=', ['geometry-type'], 'Point']], paint: {
-          'line-color': variant.color, 'line-width': 3,
-          'line-opacity': variant.phase === 'before' ? 0.75 : 1,
-          ...(variant.dash ? { 'line-dasharray': variant.dash } : {}),
+        id: outlineId, type: 'line', source: _changeSourceId, 'source-layer': 'changes',
+        filter: ['all', ...commonFilter, ['!=', ['geometry-type'], 'Point']],
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+          'line-color': variant.indicator,
+          'line-width': 3,
+          'line-opacity': 1,
+          'line-dasharray': variant.dash,
         },
       }, before);
       map.addLayer({
         id: pointId, type: 'circle', source: _changeSourceId, 'source-layer': 'changes',
-        filter: ['all', ...commonFilter, ['==', ['geometry-type'], 'Point']], paint: {
-          'circle-color': variant.color, 'circle-radius': 7,
-          'circle-stroke-color': '#111418', 'circle-stroke-width': 2,
+        filter: ['all', ...commonFilter, ['==', ['geometry-type'], 'Point']],
+        paint: {
+          'circle-color': variant.restore
+            ? ['coalesce', ['get', 'circle_color'], ['get', 'fill_color'], '#999999']
+            : 'rgba(0,0,0,0)',
+          'circle-opacity': variant.restore ? 0.4 : 1,
+          'circle-radius': ['+', ['coalesce', ['get', 'circle_radius'], 4], 2],
+          'circle-stroke-color': variant.indicator,
+          'circle-stroke-width': 3,
         },
       }, before);
-      _changeLayerIds.push(fillId, lineId, pointId);
+      _changeLayerIds.push(outlineId, pointId);
     }
     raiseMarkerLayers();
   }

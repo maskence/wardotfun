@@ -1294,7 +1294,7 @@ class TemporalMapRepository:
                 "modified": row["modified_count"], "style": row["style_count"],
             },
             "bounds": [row["west"], row["south"], row["east"], row["north"]],
-            "thumbnail_url": f"/api/map-change-images/v2/{row['area_id']}.svg",
+            "thumbnail_url": f"/api/map-change-images/v3/{row['area_id']}.svg",
             "detail_url": f"/api/map-changes/{row['area_id']}",
             "cursor": encode_change_cursor(row["observed_at"], str(row["area_id"])),
         }
@@ -1456,7 +1456,7 @@ class TemporalMapRepository:
         item.update({
             "before": before,
             "after": after,
-            "change_tile_url": f"/api/map-change-tiles/v2/{area_id}/{{z}}/{{x}}/{{y}}.pbf",
+            "change_tile_url": f"/api/map-change-tiles/v3/{area_id}/{{z}}/{{x}}/{{y}}.pbf",
         })
         return item
 
@@ -1475,11 +1475,13 @@ class TemporalMapRepository:
                     WHERE change_area.id = %s
                 ),
                 geometries AS (
-                    SELECT delta.change_type, delta.phase, delta.geometry
+                    SELECT delta.change_type, delta.phase, delta.geometry,
+                           delta.properties, delta.paint
                     FROM area
-                    CROSS JOIN LATERAL map_change_area_geometries(area.id) delta
+                    CROSS JOIN LATERAL map_change_area_styled_geometries(area.id) delta
                     UNION ALL
-                    SELECT 'context'::text, 'after'::text, context.geometry
+                    SELECT 'context'::text, 'after'::text, context.geometry,
+                           '{}'::jsonb, '{}'::jsonb
                     FROM area
                     JOIN LATERAL (
                         SELECT fv.geometry
@@ -1495,7 +1497,7 @@ class TemporalMapRepository:
                         ORDER BY fv.id LIMIT 2000
                     ) context ON true
                 )
-                SELECT change_type, phase, ST_AsGeoJSON(geometry) AS geometry
+                SELECT change_type, phase, ST_AsGeoJSON(geometry) AS geometry, properties, paint
                 FROM geometries
                 ORDER BY change_type, phase, md5(ST_AsEWKB(geometry))
                 """,
@@ -1515,23 +1517,34 @@ class TemporalMapRepository:
             x, y = _mercator_xy(float(point[0]), float(point[1]))
             return offset_x + (x - min_x) * scale, 360 - (offset_y + (y - min_y) * scale)
 
-        groups: dict[tuple[str, str], list[str]] = defaultdict(list)
+        def styled_value(row, name, default):
+            properties = row["properties"] or {}
+            paint = row["paint"] or {}
+            return properties.get(name) or paint.get(name) or default
+
+        def safe_color(value, default):
+            value = str(value)
+            return value if re.fullmatch(r"#[0-9a-fA-F]{3,8}", value) else default
+
+        rendered = []
         for row in rows:
-            groups[(row["change_type"], row["phase"])].append(
-                _svg_geometry(json.loads(row["geometry"]), project)
-            )
-        styles = {
-            ("context", "after"): "fill:#68717a;fill-opacity:.06;stroke:#68717a;stroke-opacity:.3;stroke-width:1",
-            ("added", "after"): "fill:#35c46a;fill-opacity:.35;stroke:#54e383;stroke-width:3",
-            ("removed", "before"): "fill:#e34b4b;fill-opacity:.22;stroke:#ff6868;stroke-width:3;stroke-dasharray:8 5",
-            ("modified", "before"): "fill:none;stroke:#e34b4b;stroke-opacity:.55;stroke-width:2;stroke-dasharray:6 5",
-            ("modified", "after"): "fill:#35c46a;fill-opacity:.35;stroke:#54e383;stroke-width:3",
-            ("modified", "style"): "fill:#d5a93d;fill-opacity:.28;stroke:#f0c75e;stroke-width:3",
-        }
-        layers = "".join(
-            f'<g style="{styles.get(key, "fill:none;stroke:#aaa")}">{"".join(values)}</g>'
-            for key, values in groups.items()
-        )
+            geometry = _svg_geometry(json.loads(row["geometry"]), project)
+            key = (row["change_type"], row["phase"])
+            if key == ("context", "after"):
+                style = "fill:#68717a;fill-opacity:.06;stroke:#68717a;stroke-opacity:.3;stroke-width:1"
+            else:
+                fill = safe_color(styled_value(row, "fill_color", "#999999"), "#999999")
+                indicator = "#54e383" if row["phase"] == "after" else (
+                    "#ff6868" if row["phase"] == "before" else "#f0c75e"
+                )
+                opacity = 0.16 if row["phase"] == "before" else 0.3
+                dash = "8 5" if row["phase"] == "before" else "2 5"
+                style = (
+                    f"fill:{fill};fill-opacity:{opacity};stroke:{indicator};"
+                    f"stroke-width:3;stroke-dasharray:{dash};stroke-linecap:round"
+                )
+            rendered.append(f'<g style="{style}">{geometry}</g>')
+        layers = "".join(rendered)
         if detail["counts"]["style"]:
             layers += '<rect x="120" y="72" width="400" height="216" rx="8" fill="none" stroke="#f0c75e" stroke-width="4"/><text x="320" y="188" text-anchor="middle" fill="#f0c75e" font-family="monospace" font-size="20">STYLE CHANGE</text>'
         svg = (
@@ -1540,7 +1553,7 @@ class TemporalMapRepository:
             '<path d="M0 90H640M0 180H640M0 270H640M160 0V360M320 0V360M480 0V360" stroke="#293038" stroke-width="1"/>'
             f'{layers}</svg>'
         ).encode("utf-8")
-        etag = '"' + hashlib.sha256(b"change-svg-v2:" + svg).hexdigest() + '"'
+        etag = '"' + hashlib.sha256(b"change-svg-v3:" + svg).hexdigest() + '"'
         return svg, etag
 
     def get_change_tile(self, area_id: str, z: int, x: int, y: int) -> tuple[bytes, str]:
@@ -1562,11 +1575,19 @@ class TemporalMapRepository:
                 WITH tile_bounds AS (SELECT ST_TileEnvelope(%s, %s, %s) AS geom),
                 area AS (SELECT id, observation_id FROM map_change_areas WHERE id = %s),
                 change_geometries AS (
-                    SELECT delta.logical_key, delta.change_type, delta.phase, delta.geometry
+                    SELECT delta.logical_key, delta.change_type, delta.phase, delta.geometry,
+                           delta.properties, delta.paint
                     FROM area
-                    CROSS JOIN LATERAL map_change_area_geometries(area.id) delta
+                    CROSS JOIN LATERAL map_change_area_styled_geometries(area.id) delta
                 ), tile_rows AS (
                     SELECT logical_key, change_type, phase,
+                           COALESCE(NULLIF(properties->>'fill_color', ''), NULLIF(paint->>'fill_color', ''), '#999999') AS fill_color,
+                           COALESCE(NULLIF(properties->>'line_color', ''), NULLIF(paint->>'line_color', ''), NULLIF(properties->>'fill_color', ''), NULLIF(paint->>'fill_color', ''), '#999999') AS line_color,
+                           COALESCE((properties->>'fill_opacity')::real, (paint->>'fill_opacity')::real, 0.3) AS fill_opacity,
+                           COALESCE((properties->>'line_opacity')::real, (paint->>'line_opacity')::real, 1.0) AS line_opacity,
+                           COALESCE((properties->>'line_width')::real, (paint->>'line_width')::real, 1.5) AS line_width,
+                           COALESCE(NULLIF(properties->>'circle_color', ''), NULLIF(paint->>'circle_color', ''), NULLIF(properties->>'fill_color', ''), NULLIF(paint->>'fill_color', ''), '#999999') AS circle_color,
+                           COALESCE((properties->>'circle_radius')::real, (paint->>'circle_radius')::real, 4.0) AS circle_radius,
                            ST_AsMVTGeom(ST_Transform(geometry, 3857), tile_bounds.geom,
                                         %s, %s, true) AS geom
                     FROM change_geometries CROSS JOIN tile_bounds
@@ -1579,7 +1600,7 @@ class TemporalMapRepository:
             ).fetchone()
         tile = bytes(row[0]) if row and row[0] is not None else b""
         etag = '"' + hashlib.sha256(
-            f"change-mvt-v2:{area_id}:{z}:{x}:{y}".encode("ascii")
+            f"change-mvt-v3:{area_id}:{z}:{x}:{y}".encode("ascii")
         ).hexdigest() + '"'
         return tile, etag
 

@@ -181,7 +181,7 @@ class PostGISIntegrationTests(unittest.TestCase):
         svg, svg_etag = self.repository.get_change_svg(latest["id"])
         self.assertTrue(svg.startswith(b'<svg xmlns="http://www.w3.org/2000/svg"'))
         self.assertIn(b"#54e383", svg)
-        self.assertIn(b"#e34b4b", svg)
+        self.assertIn(b"#ff6868", svg)
         self.assertTrue(svg_etag.startswith('"'))
         west, south, east, north = latest["bounds"]
         lon, lat = (west + east) / 2, (south + north) / 2

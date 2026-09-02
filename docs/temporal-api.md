@@ -41,8 +41,8 @@ the same date plus `after=CURSOR` and returns the browser-local unread count.
 `GET /api/map-changes/{area_id}` returns the exact before/after snapshot
 manifests and semantic change-tile URL used by the main-map comparison.
 Versioned SVG previews and MVT changes are served from
-`/api/map-change-images/v2/{area_id}.svg` and
-`/api/map-change-tiles/v2/{area_id}/{z}/{x}/{y}.pbf`. Both are immutable,
+`/api/map-change-images/v3/{area_id}.svg` and
+`/api/map-change-tiles/v3/{area_id}/{z}/{x}/{y}.pbf`. Both are immutable,
 year-cacheable resources. Change tiles use source layer `changes` and expose
 `change_type` (`added`, `removed`, or `modified`) plus `phase` (`before` or
 `after`).
