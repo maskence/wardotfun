@@ -6,11 +6,17 @@ import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
+
+# Make local `uvicorn main:app` and `uvicorn backend.main:app` launches behave
+# consistently. Explicit shell/systemd environment variables retain priority.
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
 
 try:
     from . import city_map
