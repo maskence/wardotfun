@@ -4,11 +4,9 @@ After=wardotfun-ingest.service
 
 [Service]
 Type=oneshot
-User=wardotfun
-Group=wardotfun
-WorkingDirectory=/opt/wardotfun
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/wardotfun
 EnvironmentFile=/etc/wardotfun/wardotfun.env
-ExecStart=/opt/wardotfun/env/bin/python -m backend.ops_healthcheck
+ExecStart=/home/ubuntu/wardotfun/.venv/bin/python -m backend.ops_healthcheck
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true

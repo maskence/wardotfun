@@ -1,24 +1,22 @@
 [Unit]
 Description=wardotfun temporal map ingestion worker
-After=network-online.target docker.service
+After=network-online.target postgresql.service
 Wants=network-online.target
-Requires=docker.service
+Requires=postgresql.service
 
 [Service]
 Type=simple
-User=wardotfun
-Group=wardotfun
-WorkingDirectory=/opt/wardotfun
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/wardotfun
 EnvironmentFile=/etc/wardotfun/wardotfun.env
-ExecStart=/opt/wardotfun/env/bin/python -m backend.ingestion_worker
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/wardotfun/.venv/bin/python -m backend.ingestion_worker
 Restart=always
 RestartSec=10
 TimeoutStopSec=30
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/wardotfun /opt/wardotfun/backend/data/mapper_cache /opt/wardotfun/backend/data/geoconfirmed_icons
 
 [Install]
 WantedBy=multi-user.target
