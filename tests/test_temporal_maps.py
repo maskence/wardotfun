@@ -437,6 +437,64 @@ class HttpTransferTests(unittest.TestCase):
             main.temporal_repository = previous_repository
             main.MAP_CHANGES_ENABLED = previous_enabled
 
+    def test_natural_change_image_is_cached_and_falls_back_while_rendering(self):
+        from starlette.requests import Request
+        import main
+
+        class Repository:
+            @staticmethod
+            def get_map_change(_area):
+                return {"id": _area}
+
+            @staticmethod
+            def get_change_svg(_area):
+                return b"<svg/>", '"fallback"'
+
+        class Renderer:
+            def __init__(self, path):
+                self.path = path
+                self.queued = []
+
+            def cached_path(self, _area):
+                return self.path
+
+            @staticmethod
+            def etag(_area):
+                return '"natural-image"'
+
+            def enqueue(self, area):
+                self.queued.append(area)
+
+        area = "11111111-1111-4111-8111-111111111111"
+        previous_repository = main.temporal_repository
+        previous_renderer = main.change_thumbnail_renderer
+        previous_enabled = main.MAP_CHANGES_ENABLED
+        main.temporal_repository = Repository()
+        main.MAP_CHANGES_ENABLED = True
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                cached = Path(temporary) / "change.webp"
+                cached.write_bytes(b"RIFFwebp")
+                renderer = Renderer(cached)
+                main.change_thumbnail_renderer = renderer
+                request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+                image = main.map_change_natural_image(request, area)
+                self.assertEqual(image.media_type, "image/webp")
+                self.assertEqual(image.body, b"RIFFwebp")
+                self.assertIn("immutable", image.headers["cache-control"])
+                self.assertEqual(renderer.queued, [])
+
+                missing = Renderer(Path(temporary) / "missing.webp")
+                main.change_thumbnail_renderer = missing
+                fallback = main.map_change_natural_image(request, area)
+                self.assertEqual(fallback.media_type, "image/svg+xml")
+                self.assertEqual(fallback.headers["cache-control"], "no-store")
+                self.assertEqual(missing.queued, [area])
+        finally:
+            main.temporal_repository = previous_repository
+            main.change_thumbnail_renderer = previous_renderer
+            main.MAP_CHANGES_ENABLED = previous_enabled
+
 
 if __name__ == "__main__":
     unittest.main()

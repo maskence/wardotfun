@@ -26,6 +26,7 @@ try:
     from .polymarket_service import PolymarketDataService
     from .database import PostGISDatabase, postgis_enabled
     from .temporal_repository import TemporalDataError, TemporalMapRepository
+    from .change_thumbnail_renderer import ChangeThumbnailRenderer
 except ImportError:  # current deployment starts uvicorn from backend/
     import city_map
     from mapper_service import MapperService
@@ -34,6 +35,7 @@ except ImportError:  # current deployment starts uvicorn from backend/
     from polymarket_service import PolymarketDataService
     from database import PostGISDatabase, postgis_enabled
     from temporal_repository import TemporalDataError, TemporalMapRepository
+    from change_thumbnail_renderer import ChangeThumbnailRenderer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -44,6 +46,7 @@ POSTGIS_READS_ENABLED = POSTGIS_CONFIGURED and os.getenv("WARDOTFUN_POSTGIS_READ
 VECTOR_TILES_ENABLED = POSTGIS_CONFIGURED and os.getenv("WARDOTFUN_VECTOR_TILES_ENABLED", "0") == "1"
 MAP_CHANGES_ENABLED = VECTOR_TILES_ENABLED and os.getenv("WARDOTFUN_MAP_CHANGES_ENABLED", "0") == "1"
 temporal_repository = TemporalMapRepository() if POSTGIS_CONFIGURED else None
+change_thumbnail_renderer = ChangeThumbnailRenderer()
 geo_service = GeolocationsService(
     read_only=POSTGIS_READS_ENABLED,
     use_postgis=POSTGIS_READS_ENABLED,
@@ -157,6 +160,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        change_thumbnail_renderer.close(wait=False)
         geo_service.stop()
         mapper_service.stop()
         market_map_update_service.stop()
@@ -353,6 +357,47 @@ def map_change_image(request: Request, area_id: str):
     if request.headers.get("if-none-match") in {etag, "*"}:
         return Response(status_code=304, headers=headers)
     return Response(content=svg, media_type="image/svg+xml", headers=headers)
+
+
+@app.get("/api/map-change-images/v6/{area_id}.webp")
+def map_change_natural_image(request: Request, area_id: str):
+    """Serve a cached natural MapLibre capture, falling back while it renders."""
+    _require_map_changes()
+    try:
+        # Validate existence before accepting an area into the render queue.
+        temporal_repository.get_map_change(area_id)
+        cached = change_thumbnail_renderer.cached_path(area_id)
+    except (TemporalDataError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="map change not found") from exc
+    if cached.is_file():
+        etag = change_thumbnail_renderer.etag(area_id)
+        headers = {
+            "ETag": etag,
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+        }
+        if request.headers.get("if-none-match") in {etag, "*"}:
+            return Response(status_code=304, headers=headers)
+        return Response(content=cached.read_bytes(), media_type="image/webp", headers=headers)
+
+    change_thumbnail_renderer.enqueue(area_id)
+    try:
+        svg, _etag = temporal_repository.get_change_svg(area_id)
+    except Exception as exc:
+        logger.exception("Map-change fallback render failed")
+        raise HTTPException(status_code=503, detail="map-change image is unavailable") from exc
+    return Response(
+        content=svg,
+        media_type="image/svg+xml",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Map-Change-Thumbnail": "rendering-fallback",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get("/api/map-change-tiles/v4/{area_id}/{z}/{x}/{y}.pbf")

@@ -17,6 +17,9 @@ set -a
 . "$environment_file"
 set +a
 
+change_thumbnail_dir="${WARDOTFUN_CHANGE_THUMBNAIL_DIR:-/var/lib/wardotfun/change-thumbnails}"
+sudo install -d -m 0750 -o ubuntu -g ubuntu "$change_thumbnail_dir"
+
 "$virtualenv_bin/python" -m backend.migrate
 
 sudo install -m 0644 deploy/systemd/wardotfun-ingest.service /etc/systemd/system/wardotfun-ingest.service

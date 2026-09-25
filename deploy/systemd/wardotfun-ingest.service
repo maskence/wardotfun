@@ -1,7 +1,7 @@
 [Unit]
 Description=wardotfun temporal map ingestion worker
-After=network-online.target postgresql.service
-Wants=network-online.target
+After=network-online.target postgresql.service wardotfun.service
+Wants=network-online.target wardotfun.service
 Requires=postgresql.service
 
 [Service]

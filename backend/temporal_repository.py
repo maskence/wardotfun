@@ -1294,7 +1294,7 @@ class TemporalMapRepository:
                 "modified": row["modified_count"], "style": row["style_count"],
             },
             "bounds": [row["west"], row["south"], row["east"], row["north"]],
-            "thumbnail_url": f"/api/map-change-images/v5/{row['area_id']}.svg",
+            "thumbnail_url": f"/api/map-change-images/v6/{row['area_id']}.webp",
             "detail_url": f"/api/map-changes/v2/{row['area_id']}",
             "cursor": encode_change_cursor(row["observed_at"], str(row["area_id"])),
         }
@@ -1401,6 +1401,42 @@ class TemporalMapRepository:
             "latest_cursor": latest_cursor,
             "unread_count": unread,
         }
+
+    def get_change_area_ids(self, observation_id: str) -> list[str]:
+        """Return renderable change areas created for one immutable observation."""
+        try:
+            observation_id = str(uuid.UUID(observation_id))
+        except (ValueError, TypeError) as exc:
+            raise TemporalDataError("invalid map-change observation") from exc
+        with self.database.connect() as conn:
+            return [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM map_change_areas WHERE observation_id = %s ORDER BY ordinal",
+                    (observation_id,),
+                )
+            ]
+
+    def get_recent_change_area_ids(self, *, limit: int = 100) -> list[str]:
+        """Return recent areas so a restarted worker can fill missing image cache."""
+        limit = max(1, min(int(limit), 500))
+        with self.database.connect() as conn:
+            return [
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT area.id
+                    FROM map_change_areas area
+                    JOIN map_snapshot_observations observation
+                      ON observation.id = area.observation_id
+                    JOIN map_sources source ON source.id = observation.source_id
+                    WHERE source.enabled
+                    ORDER BY observation.observed_at DESC, area.id DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+            ]
 
     @staticmethod
     def _snapshot_descriptor(conn, source_id: str, snapshot_id) -> dict[str, Any] | None:
