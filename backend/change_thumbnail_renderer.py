@@ -244,7 +244,10 @@ class ChangeThumbnailRenderer:
                     capture = page.call(
                         "Page.captureScreenshot",
                         {"format": "png", "fromSurface": True, "captureBeyondViewport": False},
-                        deadline=deadline,
+                        # Tile loading may legitimately consume the full scene
+                        # budget. Once ready, give Chrome a separate window to
+                        # read back the already-rendered canvas.
+                        deadline=time.monotonic() + 10,
                     )
                     png.write_bytes(base64.b64decode(capture["data"]))
                     return

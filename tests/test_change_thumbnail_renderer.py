@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 import uuid
 import base64
@@ -53,9 +54,11 @@ class ChangeThumbnailRendererTests(unittest.TestCase):
             def __init__(self):
                 self.states = iter((False, False, True))
                 self.methods = []
+                self.deadlines = []
 
             def call(self, method, _params=None, **_kwargs):
                 self.methods.append(method)
+                self.deadlines.append(_kwargs["deadline"])
                 if method == "Runtime.evaluate":
                     return {"result": {"value": '{"ready":%s,"error":null}' % str(next(self.states)).lower()}}
                 if method == "Page.captureScreenshot":
@@ -69,10 +72,11 @@ class ChangeThumbnailRendererTests(unittest.TestCase):
             page = Page()
             output = Path(temporary) / "capture.png"
             with mock.patch("backend.change_thumbnail_renderer.time.sleep"):
-                ChangeThumbnailRenderer._wait_and_capture(page, output, float("inf"))
+                ChangeThumbnailRenderer._wait_and_capture(page, output, time.monotonic() + 1)
             self.assertTrue(output.is_file())
             self.assertEqual(page.methods.count("Runtime.evaluate"), 3)
             self.assertEqual(page.methods[-1], "Page.captureScreenshot")
+            self.assertGreater(page.deadlines[-1], page.deadlines[-2])
 
     def test_thumbnail_page_has_no_fixed_time_readiness_fallback(self):
         javascript = (Path(__file__).parents[1] / "frontend" / "change-thumbnail.js").read_text()
