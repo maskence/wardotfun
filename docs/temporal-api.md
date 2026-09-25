@@ -41,7 +41,7 @@ the same date plus `after=CURSOR` and returns the browser-local unread count.
 `GET /api/map-changes/{area_id}` returns the exact before/after snapshot
 manifests and semantic change-tile URL used by the main-map comparison.
 Natural-look WebP previews and MVT changes are served from
-`/api/map-change-images/v6/{area_id}.webp` and
+`/api/map-change-images/v7/{area_id}.webp` and
 `/api/map-change-tiles/v5/{area_id}/{z}/{x}/{y}.pbf`. Change tiles use source
 layer `changes` and expose `change_type` (`added`, `removed`, or `modified`)
 plus `phase` (`before` or `after`).
@@ -49,7 +49,9 @@ plus `phase` (`before` or `after`).
 The preview renderer opens a dedicated, non-interactive map scene at
 `/change-thumbnail.html`. It combines the same satellite/vector basemap, the
 resolved after-snapshot geometry, and the semantic change overlay, then stores
-a 768x432 WebP under `WARDOTFUN_CHANGE_THUMBNAIL_DIR`. Cached previews are
+a 768x432 WebP under `WARDOTFUN_CHANGE_THUMBNAIL_DIR`. Chrome captures only
+after MapLibre reports the snapshot source, change source, and visible tiles
+fully loaded. Cached previews are
 immutable, year-cacheable resources. A missing preview is queued for one-at-a-
 time background rendering and the existing SVG preview is returned immediately
 with `no-store`, so the drawer remains responsive and retries can pick up the
