@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 python-dotenv>=1,<2
 psycopg[binary]>=3.2,<4
+Pillow>=11,<13

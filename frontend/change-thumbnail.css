@@ -1,0 +1,39 @@
+html, body, #thumbnail-map {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #111418;
+}
+
+#thumbnail-status {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  z-index: 10;
+  color: #8c969f;
+  background: #111418;
+  font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+html[data-render-ready="true"] #thumbnail-status { display: none; }
+
+#thumbnail-caption {
+  position: absolute;
+  left: 9px;
+  bottom: 8px;
+  z-index: 5;
+  max-width: 70%;
+  padding: 4px 6px;
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(12, 14, 16, 0.76);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.maplibregl-ctrl-bottom-right { bottom: 2px; right: 4px; }
+.maplibregl-ctrl-attrib { font-size: 8px; background: rgba(255, 255, 255, 0.72); }

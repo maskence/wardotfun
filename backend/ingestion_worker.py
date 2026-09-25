@@ -30,6 +30,7 @@ try:
     )
     from .geolocation_service import PostGISGeoConfirmedGeolocationsSource
     from .temporal_repository import TemporalMapRepository, canonical_json
+    from .change_thumbnail_renderer import ChangeThumbnailRenderer
 except ImportError:  # direct execution from backend/
     from database import PostGISDatabase
     from mapper_service import (
@@ -40,6 +41,7 @@ except ImportError:  # direct execution from backend/
     )
     from geolocation_service import PostGISGeoConfirmedGeolocationsSource
     from temporal_repository import TemporalMapRepository, canonical_json
+    from change_thumbnail_renderer import ChangeThumbnailRenderer
 
 log = logging.getLogger(__name__)
 DEFAULT_ARCHIVE_DIR = Path(__file__).parent / "data" / "raw_archive"
@@ -128,12 +130,14 @@ class IngestionWorker:
         repository: TemporalMapRepository | None = None,
         archive: RawArchive | None = None,
         geolocation_source=None,
+        thumbnail_renderer: ChangeThumbnailRenderer | None = None,
         poll_interval: float = 30.0,
     ):
         self.mapper_service = mapper_service or MapperService()
         self.repository = repository or TemporalMapRepository()
         self.archive = archive or RawArchive()
         self.geolocation_source = geolocation_source
+        self.thumbnail_renderer = thumbnail_renderer or ChangeThumbnailRenderer()
         self.poll_interval = poll_interval
         self.stop_event = threading.Event()
 
@@ -172,6 +176,8 @@ class IngestionWorker:
                 upstream_config=upstream_config,
                 refresh_policy=refresh_policy,
             )
+        for area_id in self.repository.get_recent_change_area_ids(limit=100):
+            self.thumbnail_renderer.enqueue(area_id)
 
     def import_baseline(self) -> list:
         """Import existing pickle caches as the first historical snapshots."""
@@ -235,6 +241,9 @@ class IngestionWorker:
                 result.snapshot_id,
                 result.feature_count,
             )
+            if result.observation_id:
+                for area_id in self.repository.get_change_area_ids(result.observation_id):
+                    self.thumbnail_renderer.enqueue(area_id)
             return result
         error = source._last_error or "upstream returned no usable layers"
         self.repository.record_failure(source.id, error, raw_records=raw_records)
@@ -271,6 +280,7 @@ class IngestionWorker:
 
     def stop(self, *_args) -> None:
         self.stop_event.set()
+        self.thumbnail_renderer.close(wait=False)
 
 
 def build_parser() -> argparse.ArgumentParser:
