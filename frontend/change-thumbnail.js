@@ -153,15 +153,14 @@
       const snapshotSource = `snapshot-${snapshot.id}`;
       map.addSource(snapshotSource, { type: 'vector', tiles: [absoluteTileUrl(snapshot.tile_url)], minzoom: 0, maxzoom: 14 });
       for (const layer of snapshot.layers || []) addSnapshotLayer(map, snapshotSource, layer);
+      const changeSource = `changes-${detail.id}`;
       addChanges(map, detail);
       document.getElementById('thumbnail-caption').textContent = `${detail.source.display_name} · map change`;
-      map.once('idle', async () => {
+      map.on('idle', async () => {
+        if (!map.areTilesLoaded() || !map.isSourceLoaded(snapshotSource) || !map.isSourceLoaded(changeSource)) return;
         if (document.fonts?.ready) await document.fonts.ready;
         requestAnimationFrame(() => requestAnimationFrame(markReady));
       });
-      // A failed optional label tile must not leave an otherwise complete
-      // satellite/vector thumbnail stuck behind its loading cover forever.
-      setTimeout(markReady, 8000);
     });
     map.on('error', event => console.error('thumbnail map error', event.error || event));
   }

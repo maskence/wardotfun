@@ -1294,7 +1294,7 @@ class TemporalMapRepository:
                 "modified": row["modified_count"], "style": row["style_count"],
             },
             "bounds": [row["west"], row["south"], row["east"], row["north"]],
-            "thumbnail_url": f"/api/map-change-images/v6/{row['area_id']}.webp",
+            "thumbnail_url": f"/api/map-change-images/v7/{row['area_id']}.webp",
             "detail_url": f"/api/map-changes/v2/{row['area_id']}",
             "cursor": encode_change_cursor(row["observed_at"], str(row["area_id"])),
         }
