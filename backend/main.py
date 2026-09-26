@@ -359,7 +359,7 @@ def map_change_image(request: Request, area_id: str):
     return Response(content=svg, media_type="image/svg+xml", headers=headers)
 
 
-@app.get("/api/map-change-images/v7/{area_id}.webp")
+@app.get("/api/map-change-images/v8/{area_id}.webp")
 def map_change_natural_image(request: Request, area_id: str):
     """Serve a cached natural MapLibre capture, falling back while it renders."""
     _require_map_changes()

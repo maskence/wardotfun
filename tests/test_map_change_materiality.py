@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 
 class MapChangeMaterialityStaticTests(unittest.TestCase):
-    def test_material_component_thresholds_and_v7_assets_are_declared(self):
+    def test_material_component_thresholds_and_v8_assets_are_declared(self):
         sql = (ROOT / "backend/migrations/006_map_change_material_components.sql").read_text()
         self.assertIn("area_m2 < 500000", sql)
         self.assertIn("inradius_m < 50", sql)
@@ -22,9 +22,9 @@ class MapChangeMaterialityStaticTests(unittest.TestCase):
         repository = (ROOT / "backend/temporal_repository.py").read_text()
         routes = (ROOT / "backend/main.py").read_text()
         self.assertIn("wardotfun:change:v3:", repository)
-        self.assertIn("/api/map-change-images/v7/", repository)
+        self.assertIn("/api/map-change-images/v8/", repository)
         self.assertIn("/api/map-change-tiles/v5/", repository)
-        self.assertIn("/api/map-change-images/v7/", routes)
+        self.assertIn("/api/map-change-images/v8/", routes)
         self.assertIn("/api/map-change-images/v5/", routes)
         self.assertIn("/api/map-change-tiles/v5/", routes)
 
