@@ -85,6 +85,14 @@ class ChangeThumbnailRendererTests(unittest.TestCase):
         self.assertIn("map.isSourceLoaded(changeSource)", javascript)
         self.assertNotIn("setTimeout(markReady", javascript)
 
+    def test_thumbnail_attribution_starts_collapsed(self):
+        javascript = (Path(__file__).parents[1] / "frontend" / "change-thumbnail.js").read_text()
+        stylesheet = (Path(__file__).parents[1] / "frontend" / "change-thumbnail.css").read_text()
+        self.assertIn("attributionControl: false", javascript)
+        self.assertIn("new maplibregl.AttributionControl({ compact: true })", javascript)
+        self.assertIn(".maplibregl-ctrl-attrib.maplibregl-compact .maplibregl-ctrl-attrib-inner", stylesheet)
+        self.assertIn("display: none !important", stylesheet)
+
 
 if __name__ == "__main__":
     unittest.main()
