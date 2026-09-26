@@ -19,7 +19,7 @@ class ChangeThumbnailRendererTests(unittest.TestCase):
             self.addCleanup(renderer.close)
             self.assertEqual(
                 renderer.cached_path(area_id),
-                Path(temporary) / "v7" / f"{area_id}.webp",
+                Path(temporary) / "v8" / f"{area_id}.webp",
             )
             with self.assertRaises(ValueError):
                 renderer.cached_path("not-an-area")
