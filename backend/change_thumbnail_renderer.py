@@ -24,7 +24,7 @@ from websocket import WebSocketTimeoutException, create_connection
 
 log = logging.getLogger(__name__)
 
-RENDER_VERSION = "v7"
+RENDER_VERSION = "v8"
 DEFAULT_ROOT = Path(__file__).parent / "data" / "change_thumbnails"
 READY_EXPRESSION = """JSON.stringify({
   ready: document.documentElement.dataset.renderReady === 'true',
