@@ -135,11 +135,12 @@
     const detail = await detailResponse.json();
     const [west, south, east, north] = detail.bounds;
     const map = new maplibregl.Map({
-      container: 'thumbnail-map', style, interactive: false, attributionControl: true,
+      container: 'thumbnail-map', style, interactive: false, attributionControl: false,
       fadeDuration: 0, preserveDrawingBuffer: true,
       bounds: [[west, south], [east, north]],
       fitBoundsOptions: { padding: 38, maxZoom: 12, duration: 0 },
     });
+    map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
     let sceneInstalled = false;
     const markReady = () => {
       if (document.documentElement.dataset.renderReady === 'true') return;
