@@ -30,4 +30,9 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
-          ssh -i ~/.ssh/wardotfun_vps -o IdentitiesOnly=yes "$VPS_USER@$VPS_HOST"
+          ssh -i ~/.ssh/wardotfun_vps \
+            -o BatchMode=yes \
+            -o ConnectTimeout=30 \
+            -o IdentitiesOnly=yes \
+            "$VPS_USER@$VPS_HOST" \
+            /home/ubuntu/wardotfun-repo/deploy/deploy-wardotfun-hook.sh
